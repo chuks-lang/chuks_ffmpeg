@@ -110,8 +110,8 @@ jobs:
   # the x86 targets fail configure ("nasm not found") in ~40s. So we run our own
   # matrix that installs those deps first, then publishes with the same command
   # the action uses: `chuks publish --prebuilt-only --platform <p> --file <so>`.
-  # windows-x86_64 is intentionally omitted: FFmpeg-from-source on MSVC needs a
-  # full MSYS2 toolchain and is tracked as separate work.
+  # windows-x86_64 is handled by the separate `publish-prebuilt-windows` job
+  # below (it needs a different, MSYS2/MinGW, toolchain).
   publish-prebuilts:
     name: prebuilt ${{ matrix.platform }}
     needs: [setup, publish-source]
@@ -229,6 +229,86 @@ jobs:
             echo "Published ${{ matrix.platform }}."
           elif grep -qi "already exists\|409" /tmp/pub.log; then
             echo "Prebuilt for ${{ matrix.platform }} already published — ok."
+          else
+            cat /tmp/pub.log; exit 1
+          fi
+
+  # windows-x86_64 prebuilt via MSYS2 + MinGW. FFmpeg-from-source can't build on
+  # the MSVC toolchain (its configure needs a POSIX shell), so we build in the
+  # MINGW64 environment (sh + gcc + nasm), targeting x86_64-pc-windows-gnu. This
+  # is a self-contained job (not part of the matrix above). Experimental: this is
+  # the hardest platform for FFmpeg-from-source; it does not block the release.
+  publish-prebuilt-windows:
+    name: prebuilt windows-x86_64
+    needs: [setup, publish-source]
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (MinGW64) with FFmpeg build tools
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel git make diffutils nasm yasm pkg-config curl unzip
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-clang mingw-w64-x86_64-rust
+
+      - name: Build shim (FFmpeg from source, static)
+        run: |
+          set -euo pipefail
+          nasm --version
+          rustc -vV
+          cargo build --release --manifest-path shim/Cargo.toml
+
+      - name: Locate produced DLL
+        id: locate
+        run: |
+          set -euo pipefail
+          DIR="shim/target/release"
+          FILE=$(find "$DIR" -maxdepth 1 -type f -name "*.dll" ! -name "*.d.dll" | head -n 1)
+          if [[ -z "$FILE" ]]; then
+            echo "::error::No .dll found in $DIR" >&2; ls -la "$DIR" || true; exit 1
+          fi
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "Built: $FILE"
+          # Report runtime deps so we can tell if the DLL is self-contained.
+          ldd "$FILE" || true
+
+      - name: Install chuks CLI
+        env:
+          CHUKS_VERSION: ${{ needs.setup.outputs.chuks_version }}
+        run: |
+          set -euo pipefail
+          BASE="chuks-windows-amd64"
+          REPO="chuks-programming-language/releases"
+          if [[ "$CHUKS_VERSION" == "latest" ]]; then
+            URL="https://github.com/$REPO/releases/latest/download/${BASE}.zip"
+          else
+            URL="https://github.com/$REPO/releases/download/${CHUKS_VERSION}/${BASE}.zip"
+          fi
+          curl -fsSL -o /tmp/chuks.zip "$URL"
+          mkdir -p /tmp/chuks-extract "$HOME/chuks/bin"
+          unzip -o /tmp/chuks.zip -d /tmp/chuks-extract
+          cp /tmp/chuks-extract/"$BASE"/chuks* "$HOME/chuks/bin/" 2>/dev/null \
+            || cp /tmp/chuks-extract/chuks* "$HOME/chuks/bin/"
+          echo "$HOME/chuks/bin" >> "$GITHUB_PATH"
+          "$HOME/chuks/bin/chuks.exe" --version || "$HOME/chuks/bin/chuks" --version || true
+
+      - name: Publish prebuilt
+        env:
+          CHUKS_TOKEN: ${{ secrets.CHUKS_TOKEN }}
+        run: |
+          set -euo pipefail
+          CHUKS="$HOME/chuks/bin/chuks.exe"; [[ -x "$CHUKS" ]] || CHUKS="$HOME/chuks/bin/chuks"
+          if "$CHUKS" publish --prebuilt-only --platform windows-x86_64 \
+               --file "${{ steps.locate.outputs.file }}" 2>&1 | tee /tmp/pub.log; then
+            echo "Published windows-x86_64."
+          elif grep -qi "already exists\|409" /tmp/pub.log; then
+            echo "Prebuilt for windows-x86_64 already published — ok."
           else
             cat /tmp/pub.log; exit 1
           fi
