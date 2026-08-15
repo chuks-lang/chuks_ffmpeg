@@ -103,13 +103,132 @@ jobs:
             fi
           fi
 
+  # NOTE: we do NOT use the generic shim-publish-action reusable workflow here.
+  # It runs `cargo build` with no system-dependency step, but @chuks/ffmpeg
+  # compiles FFmpeg from source (the `build` feature), which needs `nasm` (x86
+  # assembly), `clang`/`libclang` (rust-bindgen) and `pkg-config`. Without nasm
+  # the x86 targets fail configure ("nasm not found") in ~40s. So we run our own
+  # matrix that installs those deps first, then publishes with the same command
+  # the action uses: `chuks publish --prebuilt-only --platform <p> --file <so>`.
+  # windows-x86_64 is intentionally omitted: FFmpeg-from-source on MSVC needs a
+  # full MSYS2 toolchain and is tracked as separate work.
   publish-prebuilts:
-    name: Publish prebuilts
+    name: prebuilt ${{ matrix.platform }}
     needs: [setup, publish-source]
-    uses: chuks-programming-language/shim-publish-action/.github/workflows/build.yml@v1
-    with:
-      shim-dir: shim
-      release: true
-      chuks-version: ${{ needs.setup.outputs.chuks_version }}
-    secrets:
-      CHUKS_TOKEN: ${{ secrets.CHUKS_TOKEN }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: darwin-arm64,  runner: macos-14,         target: aarch64-apple-darwin }
+          - { platform: darwin-x86_64, runner: macos-13,         target: x86_64-apple-darwin }
+          - { platform: linux-x86_64,  runner: ubuntu-22.04,     target: x86_64-unknown-linux-gnu }
+          - { platform: linux-aarch64, runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg build deps (nasm, clang, pkg-config)
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}" in
+            Linux)
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends nasm yasm pkg-config clang libclang-dev
+              ;;
+            macOS)
+              brew install nasm pkg-config >/dev/null || brew list nasm >/dev/null
+              ;;
+          esac
+          nasm --version
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            shim/target
+          key: shim-${{ matrix.platform }}-${{ hashFiles('shim/Cargo.lock', 'shim/Cargo.toml') }}
+          restore-keys: |
+            shim-${{ matrix.platform }}-
+
+      - name: Build shim (FFmpeg from source, static)
+        shell: bash
+        run: cargo build --release --manifest-path shim/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Locate produced cdylib
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR="shim/target/${{ matrix.target }}/release"
+          case "${{ matrix.platform }}" in
+            darwin-*)  EXT="dylib" ;;
+            linux-*)   EXT="so" ;;
+          esac
+          FILE=$(find "$DIR" -maxdepth 1 -type f -name "*.$EXT" ! -name "*.d.$EXT" | head -n 1)
+          if [[ -z "$FILE" ]]; then
+            echo "::error::No .$EXT found in $DIR" >&2; ls -la "$DIR" || true; exit 1
+          fi
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "Built: $FILE"
+
+      - name: Sign macOS dylib
+        if: startsWith(matrix.platform, 'darwin-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          xattr -cr "${{ steps.locate.outputs.file }}"
+          codesign --force --sign - "${{ steps.locate.outputs.file }}"
+
+      - name: Install chuks CLI
+        shell: bash
+        env:
+          CHUKS_VERSION: ${{ needs.setup.outputs.chuks_version }}
+        run: |
+          set -euo pipefail
+          case "${{ matrix.platform }}" in
+            darwin-arm64)   BASE="chuks-darwin-arm64" ;;
+            darwin-x86_64)  BASE="chuks-darwin-amd64" ;;
+            linux-x86_64)   BASE="chuks-linux-amd64" ;;
+            linux-aarch64)  BASE="chuks-linux-arm64" ;;
+          esac
+          REPO="chuks-programming-language/releases"
+          if [[ "$CHUKS_VERSION" == "latest" ]]; then
+            URL="https://github.com/$REPO/releases/latest/download/${BASE}.tar.gz"
+          else
+            URL="https://github.com/$REPO/releases/download/${CHUKS_VERSION}/${BASE}.tar.gz"
+          fi
+          mkdir -p "$HOME/chuks/bin"
+          curl -fsSL "$URL" | tar -xz -C /tmp
+          if [[ -d "/tmp/${BASE}" ]]; then
+            cp "/tmp/${BASE}/chuks" "$HOME/chuks/bin/chuks"
+          else
+            cp /tmp/chuks "$HOME/chuks/bin/chuks"
+          fi
+          chmod +x "$HOME/chuks/bin/chuks"
+          echo "$HOME/chuks/bin" >> "$GITHUB_PATH"
+          "$HOME/chuks/bin/chuks" --version || true
+
+      - name: Publish prebuilt
+        shell: bash
+        env:
+          CHUKS_TOKEN: ${{ secrets.CHUKS_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Idempotent: a re-run over an already-published prebuilt is a no-op.
+          if chuks publish --prebuilt-only \
+               --platform "${{ matrix.platform }}" \
+               --file "${{ steps.locate.outputs.file }}" 2>&1 | tee /tmp/pub.log; then
+            echo "Published ${{ matrix.platform }}."
+          elif grep -qi "already exists\|409" /tmp/pub.log; then
+            echo "Prebuilt for ${{ matrix.platform }} already published — ok."
+          else
+            cat /tmp/pub.log; exit 1
+          fi
