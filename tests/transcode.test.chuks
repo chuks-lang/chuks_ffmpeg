@@ -1,0 +1,22 @@
+// Transcode via the guided VideoEncoder enum — macOS hardware H.264.
+import { Ffmpeg, VideoEncoder, VideoReader } from "../src/index.chuks"
+const DIR: string = "/Users/chukwuemekaigbokwe/Box/Code/ChuksPackages/chuks_ffmpeg"
+const ff: Ffmpeg = new Ffmpeg(DIR + "/shim")
+
+// Plain transcode (no filter): 320x240 in, 320x240 out.
+const n: int = ff.transcode("/tmp/ff_test.mp4", "/tmp/ff_out.mp4", VideoEncoder.H264)
+println("transcoded frames: " + string(n))
+const okPlain: bool = n == 10
+
+// Filtered transcode: downscale to 160x120 before encoding. Reads back the
+// re-encoded output to confirm the filter reshaped it (frames still 10).
+const m: int = ff.transcode("/tmp/ff_test.mp4", "/tmp/ff_scaled.mp4", VideoEncoder.H264, "scale=160:120")
+const chk: VideoReader = ff.openVideo("/tmp/ff_scaled.mp4")
+var w: int = 0
+var h: int = 0
+if (chk.next()) { w = chk.width(); h = chk.height() }
+chk.close()
+println("filtered transcode frames: " + string(m) + "  out size: " + string(w) + "x" + string(h))
+const okFiltered: bool = m == 10 && w == 160 && h == 120
+
+println("TRANSCODE OK: " + string(okPlain && okFiltered))

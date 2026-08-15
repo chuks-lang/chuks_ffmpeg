@@ -1,0 +1,48 @@
+[package]
+name = "chuks_ffmpeg_shim"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# FFmpeg via the ffmpeg-next safe wrapper over libav. The `build` feature
+# compiles FFmpeg from source and STATIC-links it into this cdylib, so the shim
+# is self-contained (no dependency on a system FFmpeg at runtime) and ships as a
+# single library via native_lib. No external codecs => LGPL; hardware encoders
+# are native. GPL codecs (x264/x265) are opt-in later via build-lib-* features.
+# ffmpeg-next handles libav's finicky lifecycle/memory/threading with Rust
+# ownership + Drop. On Linux this transitively pulls ffmpeg-sys-next with just
+# `build` => a portable software LGPL FFmpeg.
+ffmpeg-next = { version = "9", features = ["build"] }
+
+# Hardware-encoder build flags are PLATFORM-SPECIFIC: --enable-videotoolbox only
+# makes sense on macOS (passing it on Linux breaks FFmpeg's configure), so it is
+# a macOS-only direct dependency. Cargo unifies this with the ffmpeg-sys-next
+# ffmpeg-next already uses. resolve_video_encoder() then picks whichever encoder
+# was actually built at runtime (h264_videotoolbox on macOS; mpeg4/mjpeg
+# everywhere; VAAPI/NVENC when a Linux build adds those flags + SDKs).
+[target.'cfg(target_os = "macos")'.dependencies]
+ffmpeg-sys-next = { version = "9", features = ["build-videotoolbox"] }
+
+# Linux hardware encoders (VAAPI/NVENC) are enabled per-build via this optional
+# feature, since they need extra build-time SDKs (libva-dev / nv-codec-headers).
+# Build with: cargo build --release --features hw-linux
+[target.'cfg(target_os = "linux")'.dependencies]
+ffmpeg-sys-next = { version = "9", features = [] }
+
+[features]
+# Linux hardware encoders, opt-in per build (each needs its own build-time SDK):
+#   hw-vaapi  -> VAAPI  (needs libva-dev)              cargo build --features hw-vaapi
+#   hw-nvenc  -> NVENC  (needs nv-codec-headers)       cargo build --features hw-nvenc
+#   hw-linux  -> both
+hw-vaapi = ["ffmpeg-sys-next/build-vaapi"]
+hw-nvenc = ["ffmpeg-sys-next/build-nvenc"]
+hw-linux = ["hw-vaapi", "hw-nvenc"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

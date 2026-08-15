@@ -1,0 +1,21 @@
+// Audio tap: decode a 2s/44.1kHz/stereo sine → 16 kHz mono PCM. Expect ~32000
+// samples (2s × 16000), for both f32 and f64 output.
+import { Ffmpeg, AudioBuffer, FFMPEG_F32, FFMPEG_F64 } from "../src/index.chuks"
+
+const DIR: string = "/Users/chukwuemekaigbokwe/Box/Code/ChuksPackages/chuks_ffmpeg"
+const ff: Ffmpeg = new Ffmpeg(DIR + "/shim")
+println("FFmpeg: " + ff.version())
+
+const pcm: AudioBuffer = ff.decodeAudio("/tmp/ff_test.wav", FFMPEG_F32)
+const n: int = pcm.samples()
+println("f32 samples @16kHz mono: " + string(n) + " (format=" + string(pcm.format()) + ")")
+const okF32: bool = pcm.format() == FFMPEG_F32 && n > 31000 && n < 33000
+pcm.close()
+
+const pcm2: AudioBuffer = ff.decodeAudio("/tmp/ff_test.wav", FFMPEG_F64)
+const n2: int = pcm2.samples()
+println("f64 samples: " + string(n2) + " (format=" + string(pcm2.format()) + ")")
+const okF64: bool = pcm2.format() == FFMPEG_F64 && n2 > 31000 && n2 < 33000
+pcm2.close()
+
+println("AUDIO TAP OK: " + string(okF32 && okF64))

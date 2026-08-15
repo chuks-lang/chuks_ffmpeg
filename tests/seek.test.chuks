@@ -1,0 +1,46 @@
+// Seeking: duration(), pts(), and precise seek() on the 320x240 / 10fps / 1s
+// clip (10 frames at pts 0.0, 0.1, ... 0.9; a single keyframe at 0.0).
+import { Ffmpeg, VideoReader } from "../src/index.chuks"
+
+const DIR: string = "/Users/chukwuemekaigbokwe/Box/Code/ChuksPackages/chuks_ffmpeg"
+const ff: Ffmpeg = new Ffmpeg(DIR + "/shim")
+const vid: VideoReader = ff.openVideo("/tmp/ff_test.mp4")
+
+// duration ~= 1.0s
+const dur: float = vid.duration()
+println("duration: " + string(dur))
+const okDur: bool = dur > 0.9 && dur < 1.1
+
+// Read forward: first frame ~0.0, count all, last ~0.9.
+var count: int = 0
+var firstPts: float = -1.0
+var lastPts: float = -1.0
+while (vid.next()) {
+    if (count == 0) { firstPts = vid.pts() }
+    lastPts = vid.pts()
+    count = count + 1
+}
+println("forward -> frames: " + string(count) + "  first: " + string(firstPts) + "  last: " + string(lastPts))
+const okForward: bool = count == 10 && firstPts >= 0.0 && firstPts < 0.05 && lastPts > 0.85 && lastPts < 0.95
+
+// Precise seek to 0.5: next frame should land at ~0.5 (not the 0.0 keyframe),
+// and the remaining frames (0.5..0.9) = 5.
+vid.seek(0.5)
+var afterSeekPts: float = -1.0
+var remaining: int = 0
+while (vid.next()) {
+    if (remaining == 0) { afterSeekPts = vid.pts() }
+    remaining = remaining + 1
+}
+println("seek(0.5) -> landed: " + string(afterSeekPts) + "  remaining: " + string(remaining))
+const okSeek: bool = afterSeekPts > 0.45 && afterSeekPts < 0.55 && remaining == 5
+
+// Seek back to start re-decodes the whole clip (flush + resume works).
+vid.seek(0.0)
+var again: int = 0
+while (vid.next()) { again = again + 1 }
+println("seek(0.0) -> frames: " + string(again))
+const okRewind: bool = again == 10
+
+vid.close()
+println("SEEK OK: " + string(okDur && okForward && okSeek && okRewind))

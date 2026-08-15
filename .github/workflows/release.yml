@@ -1,0 +1,115 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      chuks_version:
+        description: "chuks CLI version used to BUILD & PUBLISH (e.g. v0.1.0 or 'latest'). This is the compiler version — NOT the package version."
+        required: false
+        type: string
+        default: "v0.1.0"
+
+jobs:
+  # ── Resolve the chuks CLI (compiler) version — single source of truth ──────
+  # IMPORTANT: this is the COMPILER version, completely independent of the
+  # package tag / chuks.json version. While chuks is in pre-release we pin
+  # v0.1.0; switch this to "latest" once a stable chuks release ships.
+  setup:
+    name: Resolve chuks CLI version
+    runs-on: ubuntu-22.04
+    outputs:
+      chuks_version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${{ github.event.inputs.chuks_version }}"
+          if [[ -z "$VER" ]]; then
+            VER="v0.1.0" # default for tag-triggered runs (pre-release pin)
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "chuks CLI version: $VER"
+
+  publish-source:
+    name: Publish source tarball
+    needs: setup
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + all remote branches. `chuks publish` verifies the
+          # tagged commit is on a remote branch via `git branch -r --contains`,
+          # which is empty in the default shallow detached-HEAD tag checkout.
+          fetch-depth: 0
+
+      - name: Install chuks CLI
+        shell: bash
+        env:
+          CHUKS_VERSION: ${{ needs.setup.outputs.chuks_version }}
+        run: |
+          set -euo pipefail
+          BASE="chuks-linux-amd64"
+          REPO="chuks-programming-language/releases"
+          if [[ "$CHUKS_VERSION" == "latest" ]]; then
+            URL="https://github.com/$REPO/releases/latest/download/${BASE}.tar.gz"
+          else
+            URL="https://github.com/$REPO/releases/download/${CHUKS_VERSION}/${BASE}.tar.gz"
+          fi
+          curl -fsSL "$URL" | tar -xz -C /tmp
+          mkdir -p "$HOME/chuks/bin"
+          if [[ -d "/tmp/${BASE}" ]]; then
+            mv "/tmp/${BASE}/chuks" "$HOME/chuks/bin/chuks"
+          else
+            mv /tmp/chuks "$HOME/chuks/bin/chuks"
+          fi
+          chmod +x "$HOME/chuks/bin/chuks"
+          echo "$HOME/chuks/bin" >> "$GITHUB_PATH"
+          "$HOME/chuks/bin/chuks" --version || true
+
+      # PACKAGE version check: the git tag (e.g. v1.0.0) must equal chuks.json
+      # `version` (1.0.0). This is the package version — unrelated to the
+      # chuks CLI version resolved above.
+      - name: Verify chuks.json version matches tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PKG_VER=$(jq -r .version chuks.json)
+          if [[ "$TAG" != "$PKG_VER" ]]; then
+            echo "::error::tag v$TAG does not match chuks.json version $PKG_VER" >&2
+            exit 1
+          fi
+
+      - name: Publish source
+        shell: bash
+        env:
+          CHUKS_TOKEN: ${{ secrets.CHUKS_TOKEN }}
+        run: |
+          set -euo pipefail
+          # If the version already exists in the registry, exit 0 — prebuilt
+          # jobs can still proceed.
+          if chuks publish 2>&1 | tee /tmp/pub.log; then
+            echo "Source published."
+          else
+            if grep -qi "already exists\|409" /tmp/pub.log; then
+              echo "Source version already published — continuing to prebuilts."
+            else
+              cat /tmp/pub.log
+              exit 1
+            fi
+          fi
+
+  publish-prebuilts:
+    name: Publish prebuilts
+    needs: [setup, publish-source]
+    uses: chuks-programming-language/shim-publish-action/.github/workflows/build.yml@v1
+    with:
+      shim-dir: shim
+      release: true
+      chuks-version: ${{ needs.setup.outputs.chuks_version }}
+    secrets:
+      CHUKS_TOKEN: ${{ secrets.CHUKS_TOKEN }}

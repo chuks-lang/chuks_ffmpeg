@@ -1,0 +1,12 @@
+// Smoke test: build + load the shim, read the FFmpeg version. Proves the whole
+// toolchain (ffmpeg-next → cdylib → chuksToRust → symbol resolution → string
+// round-trip) before any codec surface is added.
+
+import { Ffmpeg } from "../src/index.chuks"
+
+const DIR: string = "/Users/chukwuemekaigbokwe/Box/Code/ChuksPackages/chuks_ffmpeg"
+const ff: Ffmpeg = new Ffmpeg(DIR + "/shim")
+
+const v: string = ff.version()
+println("FFmpeg version: " + v)
+println("SKELETON OK: " + string(v != "" && v != "unknown"))

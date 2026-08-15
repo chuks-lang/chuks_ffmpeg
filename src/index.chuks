@@ -1,0 +1,270 @@
+// @chuks/ffmpeg — FFmpeg (libav) for Chuks.
+//
+// A self-contained Rust cdylib shim over the `ffmpeg-next` crate, with FFmpeg
+// compiled from source and statically linked (no system FFmpeg dependency).
+// Foundation for real-time media in Chuks: decode / encode / transcode / filter /
+// resample, the audio tap that feeds @chuks/whisper, and the frame plumbing for
+// @chuks/onnx effects. See docs/realtime-media-roadmap.md in the Chuks repo.
+//
+// ZERO-COPY (load-bearing design rule): decoded audio/video buffers are large, so
+// they are exposed as BORROWED pointers (CPtr) into the shim's own memory, which
+// downstream packages read directly — @chuks/whisper reads the 16 kHz mono PCM,
+// @chuks/onnx borrows frame planes via tensor_from_f32_borrow. Buffers never
+// round-trip through Chuks.
+//
+// Usage:
+//   import { Ffmpeg } from "pkg/@chuks/ffmpeg"
+//   const ff = new Ffmpeg()
+//   println(ff.version())                                  // "b3ef323" / "8.1"
+//   const pcm = ff.decodeAudio("clip.mp4")                 // 16 kHz mono f32
+//   println("samples: " + string(pcm.samples()))
+//   const buf = pcm.data()                                 // borrowed CPtr → whisper
+//   pcm.close()
+
+import { c, LibHandle, CFunc, CPtr, CSig } from "std/chuksToC"
+import { r } from "std/chuksToRust"
+
+// Output PCM float formats for the audio tap.
+export const FFMPEG_F32: int = 0   // 32-bit float (whisper's format)
+export const FFMPEG_F64: int = 1   // 64-bit float
+
+// Video encoders for transcode(). H264/HEVC use the macOS hardware VideoToolbox
+// encoders; MPEG4/MJPEG are native LGPL software encoders (cross-platform). Using
+// an enum guides the caller to a valid choice instead of an arbitrary string.
+export enum VideoEncoder {
+    H264,    // h264_videotoolbox (macOS hardware)
+    HEVC,    // hevc_videotoolbox (macOS hardware)
+    MPEG4,   // native MPEG-4 Part 2
+    MJPEG    // native Motion JPEG
+}
+
+// How transcode() handles the audio track. COPY keeps the original audio bytes
+// as-is (fast, lossless); AAC re-encodes to AAC (needed when changing the audio
+// codec, e.g. for a container that can't hold the source codec).
+export enum AudioEncoder {
+    COPY,    // stream-copy the audio track unchanged
+    AAC      // re-encode audio to AAC (native LGPL encoder)
+}
+
+// A decoded, resampled 16 kHz mono PCM buffer owned by the shim. Call close()
+// when done. Its samples are readable zero-copy via data().
+export class AudioBuffer {
+    var _ff: Ffmpeg
+    var _ptr: CPtr
+    var _closed: bool
+    constructor(ff: Ffmpeg, handle: CPtr) {
+        this._ff = ff
+        this._ptr = handle
+        this._closed = false
+    }
+
+    // Number of 16 kHz mono samples.
+    public samples(): int { return this._ff._audio_samples.call([this._ptr]) }
+
+    // Output float-format code: FFMPEG_F32 (0) or FFMPEG_F64 (1).
+    public format(): int { return this._ff._audio_format.call([this._ptr]) }
+
+    // Borrowed pointer to the packed PCM buffer (valid until close()). Zero-copy:
+    // pass it straight to @chuks/whisper — the samples are never copied through
+    // Chuks. The CPtr is length-tagged in bytes and marked non-owning.
+    public data(): CPtr {
+        const raw: any = this._ff._audio_ptr.call([this._ptr])
+        const n: int = this.samples()
+        const elem: int = this.format() == FFMPEG_F64 ? 8 : 4
+        return new CPtr(raw, false, n * elem)
+    }
+
+    public close(): void {
+        if (this._closed) { return }
+        this._closed = true
+        this._ff._audio_free.call([this._ptr])
+    }
+}
+
+// A frame-by-frame video decoder. Each next() advances to the next frame, scaled
+// to packed RGB24; frame() borrows that buffer zero-copy (valid until the next
+// next() / close()). Call close() when done.
+export class VideoReader {
+    var _ff: Ffmpeg
+    var _ptr: CPtr
+    var _closed: bool
+    constructor(ff: Ffmpeg, handle: CPtr) {
+        this._ff = ff
+        this._ptr = handle
+        this._closed = false
+    }
+
+    // Decode + scale the next frame to RGB24. Returns false at end of stream.
+    public next(): bool {
+        const rc: int = this._ff._video_next.call([this._ptr])
+        if (rc < 0) { throw new Error("ffmpeg.video: " + this._ff.lastError()) }
+        return rc == 1
+    }
+
+    public width(): int { return this._ff._video_width.call([this._ptr]) }
+    public height(): int { return this._ff._video_height.call([this._ptr]) }
+    // Bytes per row of the RGB buffer (>= width*3 due to alignment).
+    public stride(): int { return this._ff._video_stride.call([this._ptr]) }
+
+    // Borrowed pointer to the current RGB24 frame (valid until next()/close()).
+    // Zero-copy: hand to @chuks/onnx to build a tensor. Byte length = stride*height.
+    public frame(): CPtr {
+        const raw: any = this._ff._video_ptr.call([this._ptr])
+        return new CPtr(raw, false, this.stride() * this.height())
+    }
+
+    // Seek to the keyframe at or before `seconds`, then resume with next().
+    // Flushes the decoder and resets stream state. Throws on error.
+    public seek(seconds: float): void {
+        const rc: int = this._ff._video_seek.call([this._ptr, seconds])
+        if (rc < 0) { throw new Error("ffmpeg.seek: " + this._ff.lastError()) }
+    }
+
+    // Presentation time of the current frame in seconds (-1 if none/unknown).
+    public pts(): float { return this._ff._video_pts.call([this._ptr]) }
+
+    // Total duration of the media in seconds (-1 if unknown).
+    public duration(): float { return this._ff._video_duration.call([this._ptr]) }
+
+    public close(): void {
+        if (this._closed) { return }
+        this._closed = true
+        this._ff._video_free.call([this._ptr])
+    }
+}
+
+export class Ffmpeg {
+    var _lib: LibHandle
+    var _version: CFunc
+    var _free_string: CFunc
+    var _last_error: CFunc
+    var _audio_decode: CFunc
+    var _audio_samples: CFunc
+    var _audio_ptr: CFunc
+    var _audio_format: CFunc
+    var _audio_free: CFunc
+    var _video_open: CFunc
+    var _video_next: CFunc
+    var _video_width: CFunc
+    var _video_height: CFunc
+    var _video_stride: CFunc
+    var _video_ptr: CFunc
+    var _video_seek: CFunc
+    var _video_pts: CFunc
+    var _video_duration: CFunc
+    var _video_free: CFunc
+    var _transcode: CFunc
+    var _last_video_encoder: CFunc
+    var _has_encoder: CFunc
+
+    constructor(shimManifestDir: string = "chuks_packages/@chuks/ffmpeg") {
+        const libPath: string = r.cargoBuild(shimManifestDir, true)
+        this._lib = c.load(libPath)
+        const L: LibHandle = this._lib
+
+        this._version = L.symbol("chuks_ffmpeg_version", new CSig([], CSig.T_PTR))
+        this._free_string = L.symbol("chuks_ffmpeg_free_string", new CSig([CSig.T_PTR], CSig.T_VOID))
+        this._last_error = L.symbol("chuks_ffmpeg_last_error", new CSig([], CSig.T_PTR))
+        this._audio_decode = L.symbol("chuks_ffmpeg_audio_decode", new CSig([CSig.T_CSTRING, CSig.T_INT], CSig.T_PTR))
+        this._audio_samples = L.symbol("chuks_ffmpeg_audio_samples", new CSig([CSig.T_PTR], CSig.T_INT64))
+        this._audio_ptr = L.symbol("chuks_ffmpeg_audio_ptr", new CSig([CSig.T_PTR], CSig.T_PTR))
+        this._audio_format = L.symbol("chuks_ffmpeg_audio_format", new CSig([CSig.T_PTR], CSig.T_INT))
+        this._audio_free = L.symbol("chuks_ffmpeg_audio_free", new CSig([CSig.T_PTR], CSig.T_VOID))
+        this._video_open = L.symbol("chuks_ffmpeg_video_open", new CSig([CSig.T_CSTRING, CSig.T_CSTRING], CSig.T_PTR))
+        this._video_next = L.symbol("chuks_ffmpeg_video_next", new CSig([CSig.T_PTR], CSig.T_INT))
+        this._video_width = L.symbol("chuks_ffmpeg_video_width", new CSig([CSig.T_PTR], CSig.T_INT))
+        this._video_height = L.symbol("chuks_ffmpeg_video_height", new CSig([CSig.T_PTR], CSig.T_INT))
+        this._video_stride = L.symbol("chuks_ffmpeg_video_stride", new CSig([CSig.T_PTR], CSig.T_INT))
+        this._video_ptr = L.symbol("chuks_ffmpeg_video_ptr", new CSig([CSig.T_PTR], CSig.T_PTR))
+        this._video_seek = L.symbol("chuks_ffmpeg_video_seek", new CSig([CSig.T_PTR, CSig.T_DOUBLE], CSig.T_INT))
+        this._video_pts = L.symbol("chuks_ffmpeg_video_pts", new CSig([CSig.T_PTR], CSig.T_DOUBLE))
+        this._video_duration = L.symbol("chuks_ffmpeg_video_duration", new CSig([CSig.T_PTR], CSig.T_DOUBLE))
+        this._video_free = L.symbol("chuks_ffmpeg_video_free", new CSig([CSig.T_PTR], CSig.T_VOID))
+        this._transcode = L.symbol("chuks_ffmpeg_transcode", new CSig([CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING], CSig.T_INT64))
+        this._last_video_encoder = L.symbol("chuks_ffmpeg_last_video_encoder", new CSig([], CSig.T_PTR))
+        this._has_encoder = L.symbol("chuks_ffmpeg_has_encoder", new CSig([CSig.T_CSTRING], CSig.T_INT))
+    }
+
+    // FFmpeg build version string.
+    public version(): string {
+        return this._readAndFreeStr(this._version.call([]))
+    }
+
+    // Decode a file's best audio stream to 16 kHz MONO PCM. `fmt` is FFMPEG_F32
+    // (default, whisper's format) or FFMPEG_F64. Throws on error.
+    public decodeAudio(path: string, fmt: int = 0): AudioBuffer {
+        const raw: any = this._audio_decode.call([path, fmt])
+        const p: CPtr = new CPtr(raw, false, -1)
+        if (p.isNull()) {
+            throw new Error("ffmpeg.decodeAudio: " + this.lastError())
+        }
+        return new AudioBuffer(this, p)
+    }
+
+    // Open a media file for frame-by-frame RGB24 video decode. `filter` is an
+    // optional FFmpeg video filtergraph applied to every frame before it is
+    // handed back as RGB24, for example:
+    //   "scale=1280:720"                 resize
+    //   "crop=in_w/2:in_h:0:0"           crop the left half
+    //   "hflip"                          mirror
+    //   "fps=15"                         resample to 15 fps
+    //   "drawtext=text='hi':x=10:y=10"   burn-in text (watermark)
+    //   "scale=640:-1,hflip"             chain with commas
+    // Empty (default) = no filter. Throws on error.
+    public openVideo(path: string, filter: string = ""): VideoReader {
+        const raw: any = this._video_open.call([path, filter])
+        const p: CPtr = new CPtr(raw, false, -1)
+        if (p.isNull()) {
+            throw new Error("ffmpeg.openVideo: " + this.lastError())
+        }
+        return new VideoReader(this, p)
+    }
+
+    // Transcode a file, re-encoding video with `encoder` (default the macOS
+    // hardware H.264 encoder). `filter` is an optional video filtergraph applied
+    // before re-encoding (empty = none), e.g. "scale=1280:720" to downscale or
+    // "crop=in_w:in_h-100:0:50,scale=640:-2" to crop-then-resize. `audio` selects
+    // how the audio track is handled: AudioEncoder.COPY (default) keeps it as-is,
+    // AudioEncoder.AAC re-encodes it to AAC. Returns the number of video frames
+    // written. Throws on error.
+    public transcode(inPath: string, outPath: string, encoder: VideoEncoder = VideoEncoder.H264, filter: string = "", audio: AudioEncoder = AudioEncoder.COPY): int {
+        // Pass the codec FAMILY; the shim resolves the best encoder built for
+        // this platform (hardware first, software fallback).
+        var name: string = "mpeg4"
+        if (encoder == VideoEncoder.H264) { name = "h264" }
+        else if (encoder == VideoEncoder.HEVC) { name = "hevc" }
+        else if (encoder == VideoEncoder.MJPEG) { name = "mjpeg" }
+        var aud: string = "copy"
+        if (audio == AudioEncoder.AAC) { aud = "aac" }
+        const n: int = this._transcode.call([inPath, outPath, name, filter, aud])
+        if (n < 0) { throw new Error("ffmpeg.transcode: " + this.lastError()) }
+        return n
+    }
+
+    // The actual video encoder the last transcode() resolved to (e.g.
+    // "h264_videotoolbox" on macOS, "h264_vaapi" on a Linux HW build, "mpeg4").
+    // Empty before the first transcode. Lets callers tell hardware from software.
+    public lastVideoEncoder(): string {
+        return this._readAndFreeStr(this._last_video_encoder.call([]))
+    }
+
+    // True if `name` is an encoder compiled into this build (e.g. "h264_vaapi",
+    // "h264_videotoolbox"). Probe hardware support without attempting an encode.
+    public hasEncoder(name: string): bool {
+        return this._has_encoder.call([name]) == 1
+    }
+
+    // Last error message from the shim.
+    public lastError(): string {
+        return this._readAndFreeStr(this._last_error.call([]))
+    }
+
+    // Read a *mut c_char the shim returned, then free it via chuks_ffmpeg_free_string.
+    public _readAndFreeStr(raw: any): string {
+        const p: CPtr = new CPtr(raw, false, -1)
+        if (p.isNull()) { return "" }
+        const s: string = c.string(p)
+        this._free_string.call([p])
+        return s
+    }
+}
