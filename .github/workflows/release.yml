@@ -263,7 +263,14 @@ jobs:
           set -euo pipefail
           nasm --version
           rustc -vV
-          cargo build --release --manifest-path shim/Cargo.toml
+          echo "cc=$(which cc || true)  gcc=$(which gcc || true)"
+          if ! cargo build --release --manifest-path shim/Cargo.toml; then
+            echo "===== FFmpeg configure failed — dumping config.log tail ====="
+            find shim/target -name config.log -path "*ffmpeg*" 2>/dev/null | while read -r f; do
+              echo "----- $f -----"; tail -n 80 "$f"
+            done
+            exit 1
+          fi
 
       - name: Locate produced DLL
         id: locate
