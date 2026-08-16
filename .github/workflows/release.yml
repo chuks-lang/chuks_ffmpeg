@@ -281,21 +281,25 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      # IMPORTANT: build in pwsh, NOT bash. Git-bash prepends its own /usr/bin to
+      # PATH internally, so rustc/FFmpeg would pick Git's coreutils `link.exe`
+      # instead of MSVC's linker ("link.exe failed" on the host build scripts).
+      # pwsh respects the Windows PATH order (MSVC first, Git's sh available after).
       - name: Build shim (FFmpeg from source, MSVC toolchain)
-        shell: bash
+        shell: pwsh
         run: |
-          set -uo pipefail
-          echo "cl:   $(which cl.exe || true)"
-          echo "link: $(which link.exe || true)   (must be the MSVC linker, not Git's)"
-          echo "sh:   $(which sh || true)"
-          echo "nasm: $(which nasm || true)"
-          if ! cargo build --release --manifest-path shim/Cargo.toml --target x86_64-pc-windows-msvc; then
-            echo "===== build failed — dumping FFmpeg config.log tail ====="
-            find shim/target -name config.log -path "*ffmpeg*" 2>/dev/null | while read -r f; do
-              echo "----- $f -----"; tail -n 80 "$f"
-            done
+          Write-Host "cl:   $((Get-Command cl.exe   -ErrorAction SilentlyContinue).Source)"
+          Write-Host "link: $((Get-Command link.exe -ErrorAction SilentlyContinue).Source)  (must be MSVC, not Git)"
+          Write-Host "sh:   $((Get-Command sh.exe   -ErrorAction SilentlyContinue).Source)"
+          Write-Host "nasm: $((Get-Command nasm.exe -ErrorAction SilentlyContinue).Source)"
+          cargo build --release --manifest-path shim/Cargo.toml --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "===== build failed — dumping FFmpeg config.log tail ====="
+            Get-ChildItem -Recurse -Path shim/target -Filter config.log -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -like "*ffmpeg*" } |
+              ForEach-Object { Write-Host "----- $($_.FullName) -----"; Get-Content -Tail 80 $_.FullName }
             exit 1
-          fi
+          }
 
       - name: Locate produced DLL
         id: locate
