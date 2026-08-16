@@ -255,7 +255,8 @@ jobs:
           update: true
           install: >-
             base-devel git make diffutils nasm yasm pkg-config curl unzip
-            mingw-w64-x86_64-gcc mingw-w64-x86_64-clang mingw-w64-x86_64-rust
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-winpthreads
+            mingw-w64-x86_64-clang mingw-w64-x86_64-rust
 
       - name: Build shim (FFmpeg from source, static)
         run: |
