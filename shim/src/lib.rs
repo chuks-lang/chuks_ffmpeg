@@ -2262,3 +2262,231 @@ pub extern "C" fn chuks_ffmpeg_to_gif(
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// filter_complex — compose several images through a multi-input filtergraph
+// into one output image. The in-process equivalent of `ffmpeg -i a -i b
+// -filter_complex "…"`. Inputs are labelled in0, in1, … in the graph, so the
+// caller's spec references [in0], [in1], … and leaves the final output dangling
+// (it connects to the sink). The headline use is compositing: e.g. alpha-merge
+// a mask onto a base image to produce a transparent PNG (needs the zlib/PNG
+// build). Built incrementally (new -> add* -> run) to pass N inputs over the ABI.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub struct FilterComplex {
+    inputs: Vec<String>,
+}
+
+// Decode just the first video frame of a file (for still-image inputs).
+fn decode_first_frame(path: &str) -> Result<VideoFrame, ff::Error> {
+    let mut ictx = ff::format::input(&path)?;
+    let vidx = ictx
+        .streams()
+        .best(MediaType::Video)
+        .ok_or(ff::Error::StreamNotFound)?
+        .index();
+    let params = ictx.stream(vidx).unwrap().parameters();
+    let mut dec = ff::codec::context::Context::from_parameters(params)?
+        .decoder()
+        .video()?;
+    let mut frame = VideoFrame::empty();
+    loop {
+        match ictx.packets().next() {
+            Some((s, pkt)) => {
+                if s.index() != vidx {
+                    continue;
+                }
+                dec.send_packet(&pkt)?;
+                if dec.receive_frame(&mut frame).is_ok() {
+                    return Ok(frame);
+                }
+            }
+            None => break,
+        }
+    }
+    dec.send_eof()?;
+    if dec.receive_frame(&mut frame).is_ok() {
+        return Ok(frame);
+    }
+    Err(ff::Error::StreamNotFound)
+}
+
+// Encode a decoded frame to an image file (PNG keeps rgb24/rgba/gray as-is, so
+// alpha survives; JPEG converts to yuvj420p). Used for filter_complex output.
+fn save_frame_image(frame: &VideoFrame, path: &str) -> Result<(), ff::Error> {
+    let _ = ff::init();
+    let is_png = path.to_lowercase().ends_with(".png");
+    let enc_name = if is_png { "png" } else { "mjpeg" };
+    let codec = match ff::encoder::find_by_name(enc_name) {
+        Some(c) => c,
+        None => {
+            if is_png {
+                set_err("filter_complex: PNG encoder not in this build (needs zlib)");
+            }
+            return Err(ff::Error::EncoderNotFound);
+        }
+    };
+    let w = frame.width();
+    let h = frame.height();
+    let src = frame.format();
+    let target = if is_png {
+        match src {
+            Pixel::RGBA | Pixel::RGB24 | Pixel::GRAY8 => src,
+            _ => Pixel::RGBA, // superset that preserves any alpha
+        }
+    } else {
+        Pixel::YUVJ420P
+    };
+    let mut enc = ff::codec::context::Context::new_with_codec(codec)
+        .encoder()
+        .video()?;
+    enc.set_width(w);
+    enc.set_height(h);
+    enc.set_format(target);
+    enc.set_time_base(ff::Rational::new(1, 1));
+    let mut encoder = enc.open()?;
+
+    let mut conv = VideoFrame::empty();
+    let mut sc = Scaler::get(src, w, h, target, w, h, ScaleFlags::BILINEAR)?;
+    sc.run(frame, &mut conv)?;
+    conv.set_pts(Some(0));
+    encoder.send_frame(&conv)?;
+    encoder.send_eof()?;
+    let mut pkt = ff::Packet::empty();
+    while encoder.receive_packet(&mut pkt).is_ok() {
+        if let Some(bytes) = pkt.data() {
+            std::fs::write(path, bytes).map_err(|e| {
+                set_err(format!("filter_complex: writing {path}: {e}"));
+                ff::Error::InvalidData
+            })?;
+            return Ok(());
+        }
+    }
+    Err(ff::Error::InvalidData)
+}
+
+fn filter_complex_run(inputs: &[&str], spec: &str, output: &str) -> Result<i64, ff::Error> {
+    let _ = ff::init();
+    // 1. decode the first frame of every input.
+    let mut frames: Vec<VideoFrame> = Vec::with_capacity(inputs.len());
+    for path in inputs {
+        frames.push(decode_first_frame(path)?);
+    }
+    // 2. graph: one buffer source per input (in0, in1, …) + a buffersink (out).
+    let mut g = ff::filter::Graph::new();
+    for (i, f) in frames.iter().enumerate() {
+        let pix = f
+            .format()
+            .descriptor()
+            .map(|d| d.name())
+            .unwrap_or("rgba");
+        let args = format!(
+            "width={w}:height={h}:pix_fmt={pf}:time_base=1/1:pixel_aspect=1/1",
+            w = f.width(),
+            h = f.height(),
+            pf = pix,
+        );
+        g.add(&ff::filter::find("buffer").unwrap(), &format!("in{i}"), &args)?;
+    }
+    g.add(&ff::filter::find("buffersink").unwrap(), "out", "")?;
+    {
+        let mut parser = g.output("in0", 0)?;
+        for i in 1..frames.len() {
+            parser = parser.output(&format!("in{i}"), 0)?;
+        }
+        parser.input("out", 0)?.parse(spec)?;
+    }
+    g.validate()?;
+    // 3. feed each input frame and flush (single still per input).
+    for (i, f) in frames.iter().enumerate() {
+        let name = format!("in{i}");
+        g.get(&name).unwrap().source().add(f)?;
+        g.get(&name).unwrap().source().flush()?;
+    }
+    // 4. pull the composed frame and encode it to the output image.
+    let mut out_frame = VideoFrame::empty();
+    if g.get("out").unwrap().sink().frame(&mut out_frame).is_err() {
+        set_err("filter_complex: graph produced no output frame");
+        return Err(ff::Error::InvalidData);
+    }
+    save_frame_image(&out_frame, output)?;
+    Ok(1)
+}
+
+/// Start a filter_complex composite job. Free via fc_run, or fc_free if abandoned.
+#[no_mangle]
+pub extern "C" fn chuks_ffmpeg_fc_new() -> *mut FilterComplex {
+    Box::into_raw(Box::new(FilterComplex { inputs: Vec::new() }))
+}
+
+/// Append an input image/file to the composite. Returns 0 ok, -1 on error.
+#[no_mangle]
+pub extern "C" fn chuks_ffmpeg_fc_add(fc: *mut FilterComplex, path: *const c_char) -> c_int {
+    if fc.is_null() {
+        set_err("fc_add: null builder");
+        return -1;
+    }
+    match unsafe { cstr(path) } {
+        Some(s) => {
+            unsafe { (*fc).inputs.push(s.to_string()) };
+            0
+        }
+        None => {
+            set_err("fc_add: null path");
+            -1
+        }
+    }
+}
+
+/// Run the filter_complex `spec` over the added inputs (labelled in0, in1, …)
+/// and write the composed frame to `output` (PNG keeps alpha; JPEG by extension).
+/// FREES the builder. Returns 1 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn chuks_ffmpeg_fc_run(
+    fc: *mut FilterComplex,
+    spec: *const c_char,
+    output: *const c_char,
+) -> i64 {
+    if fc.is_null() {
+        set_err("fc_run: null builder");
+        return -1;
+    }
+    let fc = unsafe { Box::from_raw(fc) };
+    let spec = match unsafe { cstr(spec) } {
+        Some(s) => s,
+        None => {
+            set_err("fc_run: null filter spec");
+            return -1;
+        }
+    };
+    let out = match unsafe { cstr(output) } {
+        Some(s) => s,
+        None => {
+            set_err("fc_run: null output path");
+            return -1;
+        }
+    };
+    if fc.inputs.is_empty() {
+        set_err("fc_run: no inputs added");
+        return -1;
+    }
+    let refs: Vec<&str> = fc.inputs.iter().map(|s| s.as_str()).collect();
+    match filter_complex_run(&refs, spec, out) {
+        Ok(n) => n,
+        Err(e) => {
+            set_err(format!("filter_complex: {e}"));
+            -1
+        }
+    }
+}
+
+/// Free an abandoned filter_complex builder (not needed after fc_run).
+///
+/// # Safety
+/// `fc` must be null or a handle from `chuks_ffmpeg_fc_new`, not already freed.
+#[no_mangle]
+pub unsafe extern "C" fn chuks_ffmpeg_fc_free(fc: *mut FilterComplex) {
+    if !fc.is_null() {
+        drop(Box::from_raw(fc));
+    }
+}

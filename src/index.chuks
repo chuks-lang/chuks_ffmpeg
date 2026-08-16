@@ -325,6 +325,10 @@ export class Ffmpeg {
     var _save_image: CFunc
     var _encode_images: CFunc
     var _to_gif: CFunc
+    var _fc_new: CFunc
+    var _fc_add: CFunc
+    var _fc_run: CFunc
+    var _fc_free: CFunc
 
     constructor(shimManifestDir: string = "chuks_packages/@chuks/ffmpeg") {
         const libPath: string = r.cargoBuild(shimManifestDir, true)
@@ -377,6 +381,10 @@ export class Ffmpeg {
         this._save_image = L.symbol("chuks_ffmpeg_save_image", new CSig([CSig.T_PTR, CSig.T_INT, CSig.T_INT, CSig.T_INT, CSig.T_CSTRING], CSig.T_INT))
         this._encode_images = L.symbol("chuks_ffmpeg_encode_images", new CSig([CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_INT], CSig.T_INT64))
         this._to_gif = L.symbol("chuks_ffmpeg_to_gif", new CSig([CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_INT, CSig.T_CSTRING], CSig.T_INT64))
+        this._fc_new = L.symbol("chuks_ffmpeg_fc_new", new CSig([], CSig.T_PTR))
+        this._fc_add = L.symbol("chuks_ffmpeg_fc_add", new CSig([CSig.T_PTR, CSig.T_CSTRING], CSig.T_INT))
+        this._fc_run = L.symbol("chuks_ffmpeg_fc_run", new CSig([CSig.T_PTR, CSig.T_CSTRING, CSig.T_CSTRING], CSig.T_INT64))
+        this._fc_free = L.symbol("chuks_ffmpeg_fc_free", new CSig([CSig.T_PTR], CSig.T_VOID))
     }
 
     // FFmpeg build version string.
@@ -545,6 +553,32 @@ export class Ffmpeg {
     public toGif(input: string, outPath: string, fps: int = 15, scale: string = ""): int {
         const n: int = this._to_gif.call([input, outPath, fps, scale])
         if (n < 0) { throw new Error("ffmpeg.toGif: " + this.lastError()) }
+        return n
+    }
+
+    // Compose several images through a multi-input filtergraph into one output
+    // image (the in-process `ffmpeg -i a -i b -filter_complex "…"`). Inputs are
+    // labelled [in0], [in1], … in the graph in the order given; the final output
+    // pad connects to the sink automatically. Output format follows the
+    // extension: PNG keeps alpha (rgba survives), else JPEG. Examples:
+    //   // watermark a logo onto a photo
+    //   ff.composite(["photo.jpg", "logo.png"], "[in0][in1]overlay=W-w-10:H-h-10", "out.jpg")
+    //   // alpha-merge a mask onto a base -> transparent cutout PNG
+    //   ff.composite(["base.png", "mask.png"], "[in1][in0]scale2ref[m][b];[b][m]alphamerge", "cutout.png")
+    // Returns 1 on success. Throws on error.
+    public composite(inputs: []string, filterComplex: string, outPath: string): int {
+        const raw: any = this._fc_new.call([])
+        const b: CPtr = new CPtr(raw, false, -1)
+        if (b.isNull()) { throw new Error("ffmpeg.composite: " + this.lastError()) }
+        for (var i: int = 0; i < inputs.length; i = i + 1) {
+            const rc: int = this._fc_add.call([b, inputs[i]])
+            if (rc < 0) {
+                this._fc_free.call([b])
+                throw new Error("ffmpeg.composite: " + this.lastError())
+            }
+        }
+        const n: int = this._fc_run.call([b, filterComplex, outPath])
+        if (n < 0) { throw new Error("ffmpeg.composite: " + this.lastError()) }
         return n
     }
 

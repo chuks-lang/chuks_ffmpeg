@@ -15,6 +15,34 @@ video effects, and Stage 0 of `@chuks/stream` (real-time streaming).
 
 ---
 
+## What you can do
+
+Every feature below is documented with a runnable example in its own section.
+
+| I want to… | Use | Section |
+| --- | --- | --- |
+| Read a file's size/duration/codecs without decoding | `probe` → `MediaInfo` | [Probe](#probe--probe--mediainfo) |
+| Extract audio as 16 kHz mono PCM (for whisper) | `decodeAudio` | [The audio tap](#the-audio-tap--decodeaudio) |
+| Decode a video frame by frame to RGB24 | `openVideo` → `VideoReader` | [Video decode](#video-decode--openvideo--videoreader) |
+| Apply a filter while decoding (scale/crop/fps/…) | `openVideo(path, filter)` | [Filters](#filters) |
+| Jump to a timestamp | `VideoReader.seek` | [Seeking](#seeking) |
+| Re-encode a file (+ filter, + audio) | `transcode` | [Transcode](#transcode--transcode) |
+| Control bitrate / gop / crf / faststart / drop-audio | `EncodeOptions` | [Encode options](#encode-options--encodeoptions) |
+| Encode frames you render yourself → video | `createVideo` → `VideoWriter` | [Frame encoder](#frame-encoder--createvideo--videowriter) |
+| Encode a numbered image sequence → video | `encodeImages` | [Images](#images--encodeimages-saveimage-saveframe) |
+| Save a frame as PNG/JPEG | `saveImage` / `saveFrame` | [Images](#images--encodeimages-saveimage-saveframe) |
+| Add a soundtrack to a silent video | `mux` | [Muxing audio in](#muxing-audio-in--mux) |
+| Join clips end to end | `concat` | [Concat](#concat--concat) |
+| Make an animated GIF | `toGif` | [GIF](#gif--togif) |
+| Composite images (overlay / alpha-merge / stack) | `composite` | [Compositing](#compositing--composite-multi-input-filter_complex) |
+| Check which encoders are available | `hasEncoder` / `lastVideoEncoder` | [Encoder capabilities](#encoder-capabilities) |
+
+Every handle (`AudioBuffer`, `VideoReader`, `VideoWriter`, `MediaInfo`) exposes
+`close()` and works with `using const` for automatic cleanup — see the memory
+note in [Quick start](#quick-start).
+
+---
+
 ## Install
 
 ```bash
@@ -362,18 +390,18 @@ ff.encodeImages("frames/%06d.jpg", "out.mp4", 30, VideoEncoder.H264,
     "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
     new EncodeOptions().faststart())
 
-// Save the current decoder frame (after next()) to an image (JPEG or PNG*).
+// Save the current decoder frame (after next()) to an image.
 using const v = ff.openVideo("clip.mp4")
 v.seek(5.0)
-if (v.next()) { v.saveFrame("thumb.jpg") }   // thumbnail at 5s
+if (v.next()) { v.saveFrame("thumb.png") }   // thumbnail at 5s
 
 // Or from any RGB24 buffer:
 ff.saveImage(rgbPtr, width, height, "frame.jpg", stride)
 ```
 
 Image sequences carry no audio; add a soundtrack afterwards with `mux`. Output
-format follows the extension: **JPEG** (`.jpg`), BMP, TIFF. *(PNG needs zlib and
-lands in 0.1.4.)*
+format follows the extension: **PNG** (`.png`, lossless, alpha), **JPEG**
+(`.jpg`), BMP, TIFF.
 
 ## GIF — `toGif`
 
@@ -387,6 +415,32 @@ ff.toGif("clip.mp4", "out.gif", 15, "scale=480:-1:flags=lanczos")
 
 `fps` caps the rate (`0` → 15, a sane default for shareable GIFs); `scale` is an
 optional scale filter (`""` keeps the size). Returns the frame count.
+
+## Compositing — `composite` (multi-input `filter_complex`)
+
+Combine **several images through one filtergraph** into a single output image —
+the in-process `ffmpeg -i a -i b -filter_complex "…"`. Inputs are labelled
+`[in0]`, `[in1]`, … in the order given; the graph's final output connects to the
+sink automatically. The output format follows the extension (**PNG keeps alpha**).
+
+```chuks
+// Watermark a logo in the bottom-right corner of a photo.
+ff.composite(["photo.jpg", "logo.png"],
+    "[in0][in1]overlay=W-w-10:H-h-10", "out.jpg")
+
+// Alpha-merge a mask onto a base image -> a transparent cutout PNG
+// (scale2ref sizes the mask to the base, alphamerge uses it as the alpha).
+ff.composite(["base.png", "mask.png"],
+    "[in1][in0]scale2ref[m][b];[b][m]alphamerge", "cutout.png")
+
+// Stack two frames side by side.
+ff.composite(["left.png", "right.png"], "[in0][in1]hstack", "pair.png")
+```
+
+`composite(inputs, filterComplex, outPath)` decodes the first frame of each
+input, runs the graph, and writes the composed frame. Returns `1` on success;
+throws on error. Any libavfilter graph works — `overlay`, `alphamerge`,
+`blend`, `hstack`/`vstack`, `scale2ref`, and so on.
 
 ---
 

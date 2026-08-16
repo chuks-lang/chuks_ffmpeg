@@ -1,6 +1,6 @@
 [package]
 name = "chuks_ffmpeg_shim"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 
 [lib]
@@ -32,6 +32,12 @@ ffmpeg-sys-next = { version = "9", features = ["build-videotoolbox"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 ffmpeg-sys-next = { version = "9", features = [] }
 
+# NOTE: VP9 (libvpx) + Opus (libopus) for WebM are deferred. They build fine but
+# link the codec libs DYNAMICALLY, which breaks the self-contained prebuilt;
+# static-linking them across all platforms (esp. the Windows mingw cross) is a
+# separate effort. zlib/PNG below is safe because zlib is a system library
+# everywhere.
+
 [features]
 # Linux hardware encoders, opt-in per build (each needs its own build-time SDK):
 #   hw-vaapi  -> VAAPI  (needs libva-dev)              cargo build --features hw-vaapi
@@ -47,7 +53,7 @@ hw-linux = ["hw-vaapi", "hw-nvenc"]
 # One-line change; identical to upstream on every other platform. (To be PR'd
 # upstream; drop this patch once released.)
 [patch.crates-io]
-ffmpeg-sys-next = { git = "https://github.com/chuks-programming-language/rust-ffmpeg-sys", rev = "baf7e3d975ddcc91c7d409e55fd344d85fe705bf" }
+ffmpeg-sys-next = { git = "https://github.com/chuks-programming-language/rust-ffmpeg-sys", rev = "5c60819c1f9142991ba24fd0a472504182a58906" }
 
 [profile.release]
 opt-level = 3

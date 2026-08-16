@@ -62,7 +62,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "chuks_ffmpeg_shim"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "ffmpeg-next",
  "ffmpeg-sys-next",
@@ -99,7 +99,7 @@ dependencies = [
 [[package]]
 name = "ffmpeg-sys-next"
 version = "9.0.0"
-source = "git+https://github.com/chuks-programming-language/rust-ffmpeg-sys?rev=baf7e3d975ddcc91c7d409e55fd344d85fe705bf#baf7e3d975ddcc91c7d409e55fd344d85fe705bf"
+source = "git+https://github.com/chuks-programming-language/rust-ffmpeg-sys?rev=5c60819c1f9142991ba24fd0a472504182a58906#5c60819c1f9142991ba24fd0a472504182a58906"
 dependencies = [
  "bindgen",
  "cc",
