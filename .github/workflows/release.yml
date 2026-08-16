@@ -286,8 +286,10 @@ jobs:
           # (no libgcc_s / libwinpthread / libstdc++ DLL deps). Target-scoped so
           # host build scripts (compiled for linux) are unaffected.
           CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS: "-C target-feature=+crt-static"
+          # MinGW sysroot so ffmpeg-sys-next + bindgen find the Windows headers.
+          SYSROOT: "/usr/x86_64-w64-mingw32"
           # Point bindgen's clang at the mingw target when parsing FFmpeg headers.
-          BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-w64-mingw32"
+          BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-w64-mingw32 --sysroot=/usr/x86_64-w64-mingw32"
         run: |
           set -uo pipefail
           if ! cargo build --release --manifest-path shim/Cargo.toml --target x86_64-pc-windows-gnu; then

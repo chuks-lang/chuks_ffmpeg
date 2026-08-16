@@ -41,6 +41,14 @@ hw-vaapi = ["ffmpeg-sys-next/build-vaapi"]
 hw-nvenc = ["ffmpeg-sys-next/build-nvenc"]
 hw-linux = ["hw-vaapi", "hw-nvenc"]
 
+# ffmpeg-sys-next 9.0.0 passes FFmpeg `--target-os=windows`, which its configure
+# rejects ("Unknown OS 'windows'"), so cross-compiling to *-pc-windows-* fails.
+# Our fork maps the Rust "windows" target to the correct mingw64/win64 name.
+# One-line change; identical to upstream on every other platform. (To be PR'd
+# upstream; drop this patch once released.)
+[patch.crates-io]
+ffmpeg-sys-next = { git = "https://github.com/chuks-programming-language/rust-ffmpeg-sys", rev = "0521d72b3990e6ad15bf5831da390f01353133b1" }
+
 [profile.release]
 opt-level = 3
 lto = "fat"
