@@ -238,48 +238,59 @@ jobs:
             cat /tmp/pub.log; exit 1
           fi
 
-  # windows-x86_64 prebuilt via MSYS2 + MinGW. FFmpeg-from-source can't build on
-  # the MSVC toolchain (its configure needs a POSIX shell), so we build in the
-  # MINGW64 environment (sh + gcc + nasm), targeting x86_64-pc-windows-gnu. This
-  # is a self-contained job (not part of the matrix above). Experimental: this is
-  # the hardest platform for FFmpeg-from-source; it does not block the release.
-  # Experimental and NON-BLOCKING (continue-on-error). FFmpeg-from-source on
-  # Windows is unresolved: the MSYS2 image ships a bleeding-edge gcc (16.x) whose
-  # configure probes break FFmpeg 9 (no ObjC cc1obj, missing C23 stdbit.h),
-  # which cascades into "pthreads requested but not found" even with winpthreads
-  # installed. Proper fix is a focused effort: pin an older mingw gcc, or switch
-  # to the MSVC toolchain (which avoids --enable-pthreads). Only runs when
-  # dispatched with build_windows=true, so it never blocks a normal release.
+  # windows-x86_64 prebuilt via the MSVC toolchain. ffmpeg-sys-next builds FFmpeg
+  # by running `sh configure --toolchain=msvc` (so it uses cl.exe, not gcc) and
+  # does NOT force --enable-pthreads on MSVC — which sidesteps the MinGW gcc-16 /
+  # pthreads dead-end. Requirements: cl.exe (msvc-dev-cmd), `sh` + coreutils that
+  # configure calls (Git's usr/bin), nasm (x86 asm), and libclang (rust-bindgen).
+  # PATH-ORDER TRAP: Git's usr/bin ships a `link.exe` (coreutils) that shadows
+  # MSVC's linker. We add Git's tools BEFORE msvc-dev-cmd so MSVC's cl.exe/link.exe
+  # end up first on PATH. Experimental, gated behind build_windows, non-blocking.
   publish-prebuilt-windows:
     name: prebuilt windows-x86_64 (experimental)
     needs: [setup, publish-source]
     if: ${{ github.event.inputs.build_windows == 'true' }}
     continue-on-error: true
     runs-on: windows-2022
-    defaults:
-      run:
-        shell: msys2 {0}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up MSYS2 (MinGW64) with FFmpeg build tools
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: true
-          install: >-
-            base-devel git make diffutils nasm yasm pkg-config curl unzip
-            mingw-w64-x86_64-gcc mingw-w64-x86_64-winpthreads
-            mingw-w64-x86_64-clang mingw-w64-x86_64-rust
+      # Add Git's Unix tools (sh, grep, sed, awk, ...) that FFmpeg's configure
+      # needs. Done BEFORE msvc-dev-cmd so MSVC's link.exe outranks Git's.
+      - name: Add Git Unix tools to PATH
+        shell: pwsh
+        run: echo "C:\Program Files\Git\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
-      - name: Build shim (FFmpeg from source, static)
+      - name: Set up MSVC (cl.exe) environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install nasm + point bindgen at libclang
+        shell: pwsh
         run: |
-          set -euo pipefail
-          nasm --version
-          rustc -vV
-          echo "cc=$(which cc || true)  gcc=$(which gcc || true)"
-          if ! cargo build --release --manifest-path shim/Cargo.toml; then
-            echo "===== FFmpeg configure failed — dumping config.log tail ====="
+          choco install nasm --no-progress -y
+          echo "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          if (-not (Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) {
+            choco install llvm --no-progress -y
+          }
+          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install Rust toolchain (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build shim (FFmpeg from source, MSVC toolchain)
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "cl:   $(which cl.exe || true)"
+          echo "link: $(which link.exe || true)   (must be the MSVC linker, not Git's)"
+          echo "sh:   $(which sh || true)"
+          echo "nasm: $(which nasm || true)"
+          if ! cargo build --release --manifest-path shim/Cargo.toml --target x86_64-pc-windows-msvc; then
+            echo "===== build failed — dumping FFmpeg config.log tail ====="
             find shim/target -name config.log -path "*ffmpeg*" 2>/dev/null | while read -r f; do
               echo "----- $f -----"; tail -n 80 "$f"
             done
@@ -288,19 +299,19 @@ jobs:
 
       - name: Locate produced DLL
         id: locate
+        shell: bash
         run: |
           set -euo pipefail
-          DIR="shim/target/release"
+          DIR="shim/target/x86_64-pc-windows-msvc/release"
           FILE=$(find "$DIR" -maxdepth 1 -type f -name "*.dll" ! -name "*.d.dll" | head -n 1)
           if [[ -z "$FILE" ]]; then
             echo "::error::No .dll found in $DIR" >&2; ls -la "$DIR" || true; exit 1
           fi
           echo "file=$FILE" >> "$GITHUB_OUTPUT"
           echo "Built: $FILE"
-          # Report runtime deps so we can tell if the DLL is self-contained.
-          ldd "$FILE" || true
 
       - name: Install chuks CLI
+        shell: bash
         env:
           CHUKS_VERSION: ${{ needs.setup.outputs.chuks_version }}
         run: |
@@ -318,14 +329,15 @@ jobs:
           cp /tmp/chuks-extract/"$BASE"/chuks* "$HOME/chuks/bin/" 2>/dev/null \
             || cp /tmp/chuks-extract/chuks* "$HOME/chuks/bin/"
           echo "$HOME/chuks/bin" >> "$GITHUB_PATH"
-          "$HOME/chuks/bin/chuks.exe" --version || "$HOME/chuks/bin/chuks" --version || true
+          "$HOME/chuks/bin/chuks.exe" --version || true
 
       - name: Publish prebuilt
+        shell: bash
         env:
           CHUKS_TOKEN: ${{ secrets.CHUKS_TOKEN }}
         run: |
           set -euo pipefail
-          CHUKS="$HOME/chuks/bin/chuks.exe"; [[ -x "$CHUKS" ]] || CHUKS="$HOME/chuks/bin/chuks"
+          CHUKS="$HOME/chuks/bin/chuks.exe"
           if "$CHUKS" publish --prebuilt-only --platform windows-x86_64 \
                --file "${{ steps.locate.outputs.file }}" 2>&1 | tee /tmp/pub.log; then
             echo "Published windows-x86_64."
