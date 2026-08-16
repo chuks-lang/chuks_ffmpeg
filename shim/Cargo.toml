@@ -47,7 +47,7 @@ hw-linux = ["hw-vaapi", "hw-nvenc"]
 # One-line change; identical to upstream on every other platform. (To be PR'd
 # upstream; drop this patch once released.)
 [patch.crates-io]
-ffmpeg-sys-next = { git = "https://github.com/chuks-programming-language/rust-ffmpeg-sys", rev = "0521d72b3990e6ad15bf5831da390f01353133b1" }
+ffmpeg-sys-next = { git = "https://github.com/chuks-programming-language/rust-ffmpeg-sys", rev = "0083af4249634f063c9ce45bf96abed265e9875b" }
 
 [profile.release]
 opt-level = 3

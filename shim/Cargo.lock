@@ -99,7 +99,7 @@ dependencies = [
 [[package]]
 name = "ffmpeg-sys-next"
 version = "9.0.0"
-source = "git+https://github.com/chuks-programming-language/rust-ffmpeg-sys?rev=0521d72b3990e6ad15bf5831da390f01353133b1#0521d72b3990e6ad15bf5831da390f01353133b1"
+source = "git+https://github.com/chuks-programming-language/rust-ffmpeg-sys?rev=0083af4249634f063c9ce45bf96abed265e9875b#0083af4249634f063c9ce45bf96abed265e9875b"
 dependencies = [
  "bindgen",
  "cc",
