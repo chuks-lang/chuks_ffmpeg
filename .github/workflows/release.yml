@@ -255,11 +255,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Add Git's Unix tools (sh, grep, sed, awk, ...) that FFmpeg's configure
-      # needs. Done BEFORE msvc-dev-cmd so MSVC's link.exe outranks Git's.
-      - name: Add Git Unix tools to PATH
+      # FFmpeg's configure needs Git's Unix tools (sh, grep, sed, awk, ...), but
+      # Git's usr/bin also ships a coreutils `link.exe` that shadows MSVC's linker
+      # no matter the PATH order — which breaks rustc ("link.exe failed"). Delete
+      # that one file (configure never uses it) so the only link.exe is MSVC's,
+      # then put Git's tools on PATH for `sh`.
+      - name: Add Git Unix tools to PATH (minus its link.exe)
         shell: pwsh
-        run: echo "C:\Program Files\Git\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+        run: |
+          Remove-Item "C:\Program Files\Git\usr\bin\link.exe" -Force -ErrorAction SilentlyContinue
+          if (Test-Path "C:\Program Files\Git\usr\bin\link.exe") {
+            throw "Could not remove Git's link.exe (would shadow MSVC linker)"
+          }
+          echo "C:\Program Files\Git\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
       - name: Set up MSVC (cl.exe) environment
         uses: ilammy/msvc-dev-cmd@v1
