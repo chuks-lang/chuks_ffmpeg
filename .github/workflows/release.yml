@@ -268,8 +268,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 mingw-w64-tools \
-            nasm yasm make pkg-config clang libclang-dev \
-            clang-15 libclang-15-dev
+            nasm yasm make pkg-config clang libclang-dev
           # Debian's mingw gcc defaults to the win32 threading model, which has no
           # pthreads — but ffmpeg-sys-next forces --enable-pthreads. Switch to the
           # posix variant (ships winpthreads) so FFmpeg's pthread check passes.
@@ -292,12 +291,10 @@ jobs:
           # (no libgcc_s / libwinpthread / libstdc++ DLL deps). Target-scoped so
           # host build scripts (compiled for linux) are unaffected.
           CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS: "-C target-feature=+crt-static"
-          # MinGW sysroot so ffmpeg-sys-next + bindgen find the Windows headers.
-          SYSROOT: "/usr/x86_64-w64-mingw32"
-          # bindgen: use a newer libclang (14 mis-parses x86 intrinsics for the
-          # cross target) and the canonical windows-gnu triple + mingw sysroot.
-          LIBCLANG_PATH: "/usr/lib/llvm-15/lib"
-          BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-pc-windows-gnu --sysroot=/usr/x86_64-w64-mingw32"
+          # NOTE: do NOT pass --target/--sysroot to bindgen. ffmpeg-sys-next
+          # intentionally runs bindgen with the HOST clang (FFmpeg's C API is
+          # platform-independent). Forcing the windows target makes clang choke
+          # parsing its own x86 intrinsics (avx2intrin.h) for the cross target.
         run: |
           set -uo pipefail
           if ! cargo build --release --manifest-path shim/Cargo.toml --target x86_64-pc-windows-gnu; then
