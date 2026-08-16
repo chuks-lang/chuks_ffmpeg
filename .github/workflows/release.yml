@@ -273,6 +273,11 @@ jobs:
           if (Test-Path "C:\Program Files\Git\usr\bin\link.exe") {
             throw "Could not remove Git's link.exe (would shadow MSVC linker)"
           }
+          # The runner's git defaults to autocrlf=true, so ffmpeg-sys-next's clone
+          # of FFmpeg would get CRLF line endings that break awk/sh/make during the
+          # build. Force LF.
+          git config --global core.autocrlf false
+          git config --global core.eol lf
           echo "C:\Program Files\Git\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
       - name: Set up MSVC (cl.exe) environment
