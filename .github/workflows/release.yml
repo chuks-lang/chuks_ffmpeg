@@ -269,9 +269,12 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
+          # libz-mingw-w64-dev provides zlib for the mingw cross target, which
+          # FFmpeg needs for --enable-zlib (PNG). Native macOS/Linux builds find
+          # zlib in the system, but the mingw cross-sysroot has none by default.
           sudo apt-get install -y --no-install-recommends \
             gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 mingw-w64-tools \
-            nasm yasm make pkg-config clang libclang-dev
+            nasm yasm make pkg-config clang libclang-dev libz-mingw-w64-dev
           # Debian's mingw gcc defaults to the win32 threading model, which has no
           # pthreads — but ffmpeg-sys-next forces --enable-pthreads. Switch to the
           # posix variant (ships winpthreads) so FFmpeg's pthread check passes.
