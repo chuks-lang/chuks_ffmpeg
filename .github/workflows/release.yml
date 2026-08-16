@@ -291,10 +291,12 @@ jobs:
           # (no libgcc_s / libwinpthread / libstdc++ DLL deps). Target-scoped so
           # host build scripts (compiled for linux) are unaffected.
           CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS: "-C target-feature=+crt-static"
-          # NOTE: do NOT pass --target/--sysroot to bindgen. ffmpeg-sys-next
-          # intentionally runs bindgen with the HOST clang (FFmpeg's C API is
-          # platform-independent). Forcing the windows target makes clang choke
-          # parsing its own x86 intrinsics (avx2intrin.h) for the cross target.
+          # bindgen runs with the HOST clang (do NOT pass --target: FFmpeg's C API
+          # is portable). The Windows-configured headers pull in AVX2/AVX512
+          # intrinsic headers, and clang can only type-check those intrinsic
+          # bodies when the features are enabled — so enable them for PARSING
+          # (bindgen extracts types only, no codegen, so this is harmless).
+          BINDGEN_EXTRA_CLANG_ARGS: "-march=x86-64-v4"
         run: |
           set -uo pipefail
           if ! cargo build --release --manifest-path shim/Cargo.toml --target x86_64-pc-windows-gnu; then
