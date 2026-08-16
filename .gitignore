@@ -1,6 +1,9 @@
 # Build artifacts
+tests/
+docs/
 build/
 shim/target/
+shim/Cargo.lock.bak
 
 # Native libraries (built locally; published separately as prebuilts)
 *.dylib
