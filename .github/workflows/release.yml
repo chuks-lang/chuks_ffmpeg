@@ -285,10 +285,14 @@ jobs:
         with:
           arch: x64
 
-      - name: Install nasm + point bindgen at libclang
+      - name: Install nasm + make + point bindgen at libclang
         shell: pwsh
         run: |
-          choco install nasm --no-progress -y
+          # GNU make: FFmpeg's Makefiles run recipes (incl. the awk dep-gen that
+          # uses gsub(/\\/,"/")) through a shell. GNU make uses sh when it finds
+          # sh.exe (Git's, on PATH); a make that falls back to cmd.exe strips a
+          # backslash level and corrupts that awk regex ("^ syntax error").
+          choco install make nasm --no-progress -y
           echo "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           if (-not (Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) {
             choco install llvm --no-progress -y
