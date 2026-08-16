@@ -291,12 +291,14 @@ jobs:
           # (no libgcc_s / libwinpthread / libstdc++ DLL deps). Target-scoped so
           # host build scripts (compiled for linux) are unaffected.
           CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS: "-C target-feature=+crt-static"
-          # bindgen runs with the HOST clang (do NOT pass --target: FFmpeg's C API
-          # is portable). The Windows-configured headers pull in AVX2/AVX512
-          # intrinsic headers, and clang can only type-check those intrinsic
-          # bodies when the features are enabled — so enable them for PARSING
-          # (bindgen extracts types only, no codegen, so this is harmless).
-          BINDGEN_EXTRA_CLANG_ARGS: "-march=x86-64-v4"
+          # Force bindgen's clang to the HOST target. FFmpeg's C API is portable,
+          # so the crate intends bindgen to run host-target. If clang gets the
+          # Windows target it finds mingw's d3d11.h/d3d12.h, and ffmpeg-sys-next's
+          # hwcontext wrapper then pulls <windows.h> -> x86 intrinsic headers that
+          # host clang can't type-check ("invalid conversion ... __m128i/int").
+          # Host target -> those __has_include(<d3d11.h>) checks fail -> the D3D
+          # hwcontext blocks (which we don't use) are skipped. Validated locally.
+          BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-unknown-linux-gnu"
         run: |
           set -uo pipefail
           if ! cargo build --release --manifest-path shim/Cargo.toml --target x86_64-pc-windows-gnu; then
