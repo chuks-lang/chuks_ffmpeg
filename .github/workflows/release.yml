@@ -165,6 +165,12 @@ jobs:
 
       - name: Build shim (FFmpeg from source, static)
         shell: bash
+        env:
+          # Portable prebuilt: omit -march=native/-mtune=native so the shipped
+          # binary isn't tuned to this runner's exact CPU (which risks SIGILL on
+          # older user CPUs). Empty string tells ffmpeg-sys-next to drop the flag.
+          FFMPEG_MARCH: ""
+          FFMPEG_MTUNE: ""
         run: cargo build --release --manifest-path shim/Cargo.toml --target ${{ matrix.target }}
 
       - name: Locate produced cdylib
@@ -295,6 +301,12 @@ jobs:
       # pwsh respects the Windows PATH order (MSVC first, Git's sh available after).
       - name: Build shim (FFmpeg from source, MSVC toolchain)
         shell: pwsh
+        env:
+          # ffmpeg-sys-next defaults to GCC flags -march=native -mtune=native,
+          # which MSVC's cl.exe rejects (D8043). Empty = omit them. Also makes
+          # the prebuilt portable (not tuned to this runner's CPU).
+          FFMPEG_MARCH: ""
+          FFMPEG_MTUNE: ""
         run: |
           Write-Host "cl:   $((Get-Command cl.exe   -ErrorAction SilentlyContinue).Source)"
           Write-Host "link: $((Get-Command link.exe -ErrorAction SilentlyContinue).Source)  (must be MSVC, not Git)"
