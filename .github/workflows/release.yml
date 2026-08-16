@@ -251,11 +251,14 @@ jobs:
   # Windows-native shell breakage applies (backslash-eating awk, Git's link.exe
   # shadowing MSVC, the winpthreads dance). ffmpeg-sys-next auto-detects
   # host != target and adds --enable-cross-compile + --cross-prefix.
-  # Gated behind build_windows so it never blocks a normal release.
+  # Runs on every tagged release (the Windows cross-compile from Linux is solved
+  # and reliable) and also on a manual build_windows dispatch. Kept
+  # continue-on-error so a transient cross-build/runner hiccup can never red-X a
+  # release whose source + other prebuilts already published in separate jobs.
   publish-prebuilt-windows:
     name: prebuilt windows-x86_64
     needs: [setup, publish-source]
-    if: ${{ github.event.inputs.build_windows == 'true' }}
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || github.event.inputs.build_windows == 'true' }}
     continue-on-error: true
     runs-on: ubuntu-22.04
     steps:

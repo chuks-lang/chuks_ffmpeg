@@ -32,28 +32,31 @@ const ff = new Ffmpeg()
 println(ff.version())                                   // FFmpeg build string
 
 // 1. Audio tap: any file -> 16 kHz mono PCM (whisper's format), zero-copy.
-const pcm = ff.decodeAudio("clip.mp4")
+//    `using const` closes the buffer automatically at the end of the block.
+using const pcm = ff.decodeAudio("clip.mp4")
 println("samples: " + string(pcm.samples()))            // ~16000 per second
 const buf = pcm.data()                                  // borrowed CPtr -> whisper
-pcm.close()
 
 // 2. Video: decode frame-by-frame to RGB24, zero-copy.
-const vid = ff.openVideo("clip.mp4")
+using const vid = ff.openVideo("clip.mp4")
 while (vid.next()) {
     const rgb = vid.frame()                             // borrowed CPtr -> onnx
     // ... use rgb (width()*height()*3 bytes, rows of stride()) ...
 }
-vid.close()
 
 // 3. Transcode: re-encode video (+ keep audio), optionally filter.
 const frames = ff.transcode("in.mov", "out.mp4",
     VideoEncoder.H264, "scale=1280:720", AudioEncoder.COPY)
 println("wrote " + string(frames) + " frames with " + ff.lastVideoEncoder())
+// pcm.close() and vid.close() run here automatically (LIFO).
 ```
 
-> **Memory.** `AudioBuffer` and `VideoReader` own shim-side state — call
-> `.close()` when done (safe to call twice). Buffers returned by `data()` /
-> `frame()` are **borrowed** and valid only until the next call / `close()`.
+> **Memory.** `AudioBuffer`, `VideoReader`, `VideoWriter` and `MediaInfo` own
+> shim-side state and expose `close()`. Bind them with **`using const`** and the
+> compiler closes each one for you on every exit path (return, throw, break) —
+> the idiom throughout this manual. You can still call `.close()` explicitly
+> (it's idempotent). Buffers returned by `data()` / `frame()` are **borrowed** and
+> valid only until the next call / `close()`.
 
 `new Ffmpeg(shimDir?)` builds (or loads the cached) shim. `shimDir` defaults to
 `chuks_packages/@chuks/ffmpeg`; pass an explicit path only when developing
@@ -209,6 +212,114 @@ Use `lastVideoEncoder()` after a transcode to see what was chosen.
 | ------ | ------------------------------------------------------------------------ |
 | `COPY` | Stream-copy the audio unchanged (fast, lossless). Default.               |
 | `AAC`  | Re-encode the audio to AAC (needed when the container can't hold the source codec, or to normalize it). |
+
+---
+
+## Frame encoder — `createVideo` / `VideoWriter`
+
+The inverse of `openVideo`: when your program *renders its own frames* (an editor,
+a generator, a compositor), push them straight into an encoder instead of shelling
+out to an `ffmpeg` binary or writing intermediate image files.
+
+```chuks
+// 640x360, 30 fps, hardware H.264.
+const w = ff.createVideo("out.mp4", 640, 360, 30, VideoEncoder.H264)
+for (var i = 0; i < 90; i = i + 1) {
+    const rgb = renderMyFrameRGB24(i)   // a CPtr to width*height*3 bytes
+    w.writeFrame(rgb)                   // stride defaults to width*3 (packed)
+}
+const frames = w.close()               // flush + finalize; returns frame count
+```
+
+| `createVideo` arg | Default             | Description                                       |
+| ----------------- | ------------------- | ------------------------------------------------- |
+| `outPath`         | —                   | Output file (container inferred from extension).  |
+| `width` `height`  | —                   | Frame size in pixels.                             |
+| `fps`             | `30`                | Frames per second (integer timebase `fps/1`).     |
+| `encoder`         | `VideoEncoder.H264` | Codec family, resolved like `transcode`.          |
+
+`w.close()` returns the frame count (as above). If you don't need the count, bind
+the writer with `using const` and it finalizes automatically at block end.
+
+`writeFrame(rgb, stride = 0)` encodes one RGB24 frame. `rgb` is a `CPtr` to
+`width*height*3` bytes; `stride` is its bytes-per-row (`0` = packed `width*3`).
+Zero-copy: the buffer is borrowed for the call only, so a decoder frame flows
+straight through without a copy:
+
+```chuks
+// Re-encode by piping a reader's frames into a writer (padded stride and all).
+using const src = ff.openVideo("in.mp4")
+using const dst = ff.createVideo("out.mp4", 1920, 1080, 30)
+while (src.next()) { dst.writeFrame(src.frame(), src.stride()) }
+// dst.close() then src.close() run automatically at block end (LIFO).
+```
+
+## Muxing audio in — `mux`
+
+`createVideo` writes a silent video. To attach a soundtrack (the common editor
+export: render frames, then add the timeline's audio) stream-copy the two files
+together:
+
+```chuks
+ff.createVideo("silent.mp4", w, h, 30)  // ... write frames ... close()
+const n = ff.mux("silent.mp4", "score.m4a", "final.mp4")   // -> video pkt count
+```
+
+`mux(videoPath, audioPath, outPath)` takes the best video stream from the first
+file and the best audio stream from the second, interleaves their packets by
+timestamp, and copies both without re-encoding (no quality loss). Throws on error.
+
+---
+
+## Probe — `probe` / `MediaInfo`
+
+Read a file's metadata **without decoding a single frame** — cheap enough to run
+on every clip you import, to show its size/length or validate it before use.
+
+```chuks
+using const info = ff.probe("clip.mp4")
+println(string(info.width()) + "x" + string(info.height())
+    + " @ " + string(info.fps()) + "fps, " + string(info.duration()) + "s")
+if (info.hasAudio()) {
+    println("audio: " + info.audioCodec()
+        + " " + string(info.sampleRate()) + "Hz x" + string(info.channels()))
+}
+```
+
+`MediaInfo` accessors:
+
+| Call             | Description                                          |
+| ---------------- | ---------------------------------------------------- |
+| `.hasVideo()` / `.hasAudio()` | Whether that stream is present.         |
+| `.width()` `.height()` | Video frame size in pixels (`0` if none).      |
+| `.duration()`    | Container duration in seconds (`-1` if unknown).     |
+| `.fps()`         | Average video frame rate (`0` if none).              |
+| `.frameCount()`  | Video frame count if the container records it (`0` if unknown). |
+| `.bitRate()`     | Overall bitrate in bits/sec (`0` if unknown).        |
+| `.sampleRate()` `.channels()` | Audio rate in Hz / channel count (`0` if none). |
+| `.videoCodec()` `.audioCodec()` | Codec short names, e.g. `"h264"` / `"aac"` (empty if absent). |
+| `.close()`       | Release the handle (or use `using const`).           |
+
+All accessors are typed (no map/JSON), so the VM and AOT report identical values.
+
+## Concat — `concat`
+
+Join clips end to end by **stream copy** (no re-encode), the in-process
+equivalent of the ffmpeg concat demuxer. This is what a chunked exporter needs to
+stitch its segments into one file:
+
+```chuks
+const packets = ff.concat(
+    ["chunk_000.mp4", "chunk_001.mp4", "chunk_002.mp4"],
+    "final.mp4")
+```
+
+Streams are taken from the first file and each subsequent file's timestamps are
+shifted by the running duration, so playback is continuous. **The inputs must
+share a stream layout** (same codecs, resolution, sample rate) — exactly the case
+for an editor's own export chunks. Returns the number of packets written; throws
+on error. For clips with mismatched formats, normalize them with `transcode`
+first, then `concat`.
 
 ---
 

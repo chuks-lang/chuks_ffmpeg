@@ -1218,3 +1218,698 @@ pub extern "C" fn chuks_ffmpeg_transcode(
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Frame encoder — push rendered RGB24 frames, get an encoded video file.
+//
+// The inverse of the video reader: an editor renders frames itself and pushes
+// them here to be scaled (RGB24 -> yuv420p), encoded, and muxed, WITHOUT
+// shelling out to an ffmpeg binary. writeFrame borrows the caller's packed
+// RGB24 buffer (width*height*3) only for the duration of the call. The encoder
+// family is resolved adaptively (hardware first) via resolve_video_encoder,
+// exactly like transcode.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub struct VideoWriter {
+    octx: ff::format::context::Output,
+    encoder: ff::codec::encoder::video::Encoder,
+    scaler: Scaler,
+    rgb: VideoFrame,
+    yuv: VideoFrame,
+    ost_index: usize,
+    ost_tb: ff::Rational,
+    enc_tb: ff::Rational,
+    width: u32,
+    height: u32,
+    pts: i64,
+    count: i64,
+}
+
+fn video_writer_open(
+    path: &str,
+    width: u32,
+    height: u32,
+    fps_num: i32,
+    fps_den: i32,
+    encoder_name: &str,
+) -> Result<VideoWriter, ff::Error> {
+    let _ = ff::init();
+    let fps = if fps_num > 0 && fps_den > 0 {
+        ff::Rational::new(fps_num, fps_den)
+    } else {
+        ff::Rational::new(30, 1)
+    };
+    let mut octx = ff::format::output(&path)?;
+    let codec = resolve_video_encoder(encoder_name).ok_or(ff::Error::EncoderNotFound)?;
+    let global_header = octx
+        .format()
+        .flags()
+        .contains(ff::format::flag::Flags::GLOBAL_HEADER);
+
+    let mut enc = ff::codec::context::Context::new_with_codec(codec)
+        .encoder()
+        .video()?;
+    enc.set_width(width);
+    enc.set_height(height);
+    enc.set_format(Pixel::YUV420P);
+    enc.set_time_base(fps.invert());
+    enc.set_frame_rate(Some(fps));
+    if global_header {
+        enc.set_flags(ff::codec::flag::Flags::GLOBAL_HEADER);
+    }
+    let encoder = enc.open()?;
+
+    let ost_index = {
+        let mut ost = octx.add_stream(codec)?;
+        ost.set_parameters(&encoder);
+        ost.set_time_base(fps.invert());
+        ost.index()
+    };
+    octx.write_header()?;
+    let ost_tb = octx.stream(ost_index).unwrap().time_base();
+    let enc_tb = encoder.time_base();
+
+    let scaler = Scaler::get(
+        Pixel::RGB24,
+        width,
+        height,
+        Pixel::YUV420P,
+        width,
+        height,
+        ScaleFlags::BILINEAR,
+    )?;
+
+    Ok(VideoWriter {
+        octx,
+        encoder,
+        scaler,
+        rgb: VideoFrame::new(Pixel::RGB24, width, height),
+        yuv: VideoFrame::new(Pixel::YUV420P, width, height),
+        ost_index,
+        ost_tb,
+        enc_tb,
+        width,
+        height,
+        pts: 0,
+        count: 0,
+    })
+}
+
+fn video_writer_write(w: &mut VideoWriter, data: &[u8], in_stride: usize) -> Result<(), ff::Error> {
+    // Copy RGB24 into the frame's own (possibly padded) stride, row by row. The
+    // caller's rows may themselves be padded (`in_stride`), so a stride-padded
+    // buffer from the video reader can be fed straight through without repacking.
+    let row = (w.width * 3) as usize;
+    let src_stride = if in_stride == 0 { row } else { in_stride };
+    let dst_stride = w.rgb.stride(0);
+    {
+        let dst = w.rgb.data_mut(0);
+        for y in 0..w.height as usize {
+            dst[y * dst_stride..y * dst_stride + row]
+                .copy_from_slice(&data[y * src_stride..y * src_stride + row]);
+        }
+    }
+    w.scaler.run(&w.rgb, &mut w.yuv)?;
+    w.yuv.set_pts(Some(w.pts));
+    w.pts += 1;
+    w.count += 1;
+    w.encoder.send_frame(&w.yuv)?;
+    let mut pkt = ff::Packet::empty();
+    while w.encoder.receive_packet(&mut pkt).is_ok() {
+        pkt.set_stream(w.ost_index);
+        pkt.set_duration(1);
+        pkt.rescale_ts(w.enc_tb, w.ost_tb);
+        pkt.write_interleaved(&mut w.octx)?;
+    }
+    Ok(())
+}
+
+fn video_writer_finish(w: &mut VideoWriter) -> Result<(), ff::Error> {
+    w.encoder.send_eof()?;
+    let mut pkt = ff::Packet::empty();
+    while w.encoder.receive_packet(&mut pkt).is_ok() {
+        pkt.set_stream(w.ost_index);
+        pkt.set_duration(1);
+        pkt.rescale_ts(w.enc_tb, w.ost_tb);
+        pkt.write_interleaved(&mut w.octx)?;
+    }
+    w.octx.write_trailer()?;
+    Ok(())
+}
+
+/// Open a frame encoder. `encoder` is a codec FAMILY ("h264"/"hevc"/"mpeg4"/
+/// "mjpeg"), resolved to the best encoder available for this platform/build.
+/// fps is num/den (pass 30,1 for 30fps). Returns an opaque *mut VideoWriter, or
+/// null on error (see chuks_ffmpeg_last_error).
+#[no_mangle]
+pub extern "C" fn chuks_ffmpeg_venc_open(
+    path: *const c_char,
+    width: c_int,
+    height: c_int,
+    fps_num: c_int,
+    fps_den: c_int,
+    encoder: *const c_char,
+) -> *mut VideoWriter {
+    let path = match unsafe { cstr(path) } {
+        Some(s) => s,
+        None => {
+            set_err("venc_open: null path");
+            return ptr::null_mut();
+        }
+    };
+    let family = unsafe { cstr(encoder) }.unwrap_or("h264");
+    if width <= 0 || height <= 0 {
+        set_err("venc_open: width/height must be > 0");
+        return ptr::null_mut();
+    }
+    match video_writer_open(path, width as u32, height as u32, fps_num, fps_den, family) {
+        Ok(w) => Box::into_raw(Box::new(w)),
+        Err(e) => {
+            set_err(format!("venc_open: {e}"));
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Push one RGB24 frame. `stride` is the input's bytes per row (0 = packed,
+/// i.e. width*3); pass a video reader's stride() to feed its frames through
+/// zero-copy. `byte_len` must cover stride*height. Returns 0 ok, -1 on error.
+#[no_mangle]
+pub extern "C" fn chuks_ffmpeg_venc_write(
+    writer: *mut VideoWriter,
+    data: *const c_void,
+    byte_len: c_int,
+    stride: c_int,
+) -> c_int {
+    if writer.is_null() || data.is_null() {
+        set_err("venc_write: null writer/data");
+        return -1;
+    }
+    let w = unsafe { &mut *writer };
+    let row = (w.width as usize) * 3;
+    let in_stride = if stride <= 0 { row } else { stride as usize };
+    if in_stride < row {
+        set_err(format!("venc_write: stride {} < width*3 {}", in_stride, row));
+        return -1;
+    }
+    let need = in_stride * (w.height as usize);
+    if (byte_len as usize) < need {
+        set_err(format!(
+            "venc_write: need {} bytes for {}x{} RGB24 (stride {}), got {}",
+            need, w.width, w.height, in_stride, byte_len
+        ));
+        return -1;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(data as *const u8, need) };
+    match video_writer_write(w, slice, in_stride) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_err(format!("venc_write: {e}"));
+            -1
+        }
+    }
+}
+
+/// Flush, write the trailer, then close and FREE the writer. Returns the number
+/// of frames written (>=0), or -1 on error. The pointer is invalid afterwards.
+#[no_mangle]
+pub extern "C" fn chuks_ffmpeg_venc_close(writer: *mut VideoWriter) -> i64 {
+    if writer.is_null() {
+        set_err("venc_close: null writer");
+        return -1;
+    }
+    let mut w = unsafe { Box::from_raw(writer) };
+    match video_writer_finish(&mut w) {
+        Ok(()) => w.count,
+        Err(e) => {
+            set_err(format!("venc_close: {e}"));
+            -1
+        }
+    }
+    // w dropped here -> encoder + octx freed
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// mux — combine a video file and an audio file into one container by stream
+// copy (no re-encode). Pairs with the frame encoder: render frames -> silent
+// video, then mux in the timeline's audio. Packets are interleaved by rescaled
+// dts so the muxer never has to buffer a whole stream.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn mux_video_audio(video_path: &str, audio_path: &str, out_path: &str) -> Result<i64, ff::Error> {
+    use ff::util::mathematics::Rescale;
+    let _ = ff::init();
+    let mut vin = ff::format::input(&video_path)?;
+    let mut ain = ff::format::input(&audio_path)?;
+
+    let v_idx = vin
+        .streams()
+        .best(MediaType::Video)
+        .ok_or(ff::Error::StreamNotFound)?
+        .index();
+    let v_in_tb = vin.stream(v_idx).unwrap().time_base();
+    let a_idx = ain
+        .streams()
+        .best(MediaType::Audio)
+        .ok_or(ff::Error::StreamNotFound)?
+        .index();
+    let a_in_tb = ain.stream(a_idx).unwrap().time_base();
+
+    let mut octx = ff::format::output(&out_path)?;
+    // video -> stream 0
+    {
+        let params = vin.stream(v_idx).unwrap().parameters();
+        let mut ost = octx.add_stream(ff::encoder::find(ff::codec::Id::None))?;
+        ost.set_parameters(params);
+        unsafe {
+            (*ost.parameters().as_mut_ptr()).codec_tag = 0;
+        }
+    }
+    // audio -> stream 1
+    {
+        let params = ain.stream(a_idx).unwrap().parameters();
+        let mut ost = octx.add_stream(ff::encoder::find(ff::codec::Id::None))?;
+        ost.set_parameters(params);
+        unsafe {
+            (*ost.parameters().as_mut_ptr()).codec_tag = 0;
+        }
+    }
+    octx.write_header()?;
+    let v_out_tb = octx.stream(0).unwrap().time_base();
+    let a_out_tb = octx.stream(1).unwrap().time_base();
+
+    const COMMON: (i32, i32) = (1, 1_000_000);
+    let mut count: i64 = 0;
+    let mut vpkt: Option<ff::Packet> = None;
+    let mut apkt: Option<ff::Packet> = None;
+    let mut vdone = false;
+    let mut adone = false;
+
+    // Pull the next packet belonging to $idx from $ctx, skipping other streams.
+    macro_rules! fill {
+        ($slot:ident, $ctx:ident, $idx:ident, $done:ident) => {
+            if $slot.is_none() && !$done {
+                loop {
+                    match $ctx.packets().next() {
+                        Some((s, p)) => {
+                            if s.index() == $idx {
+                                $slot = Some(p);
+                                break;
+                            }
+                        }
+                        None => {
+                            $done = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        };
+    }
+
+    loop {
+        fill!(vpkt, vin, v_idx, vdone);
+        fill!(apkt, ain, a_idx, adone);
+        if vpkt.is_none() && apkt.is_none() {
+            break;
+        }
+        // Compare dts in a common time base; write the earlier packet.
+        let vk = vpkt
+            .as_ref()
+            .map(|p| p.dts().unwrap_or(0).rescale(v_in_tb, COMMON));
+        let ak = apkt
+            .as_ref()
+            .map(|p| p.dts().unwrap_or(0).rescale(a_in_tb, COMMON));
+        let take_video = match (vk, ak) {
+            (Some(v), Some(a)) => v <= a,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        if take_video {
+            let mut p = vpkt.take().unwrap();
+            p.set_stream(0);
+            p.rescale_ts(v_in_tb, v_out_tb);
+            p.set_position(-1);
+            p.write_interleaved(&mut octx)?;
+            count += 1;
+        } else {
+            let mut p = apkt.take().unwrap();
+            p.set_stream(1);
+            p.rescale_ts(a_in_tb, a_out_tb);
+            p.set_position(-1);
+            p.write_interleaved(&mut octx)?;
+        }
+    }
+    octx.write_trailer()?;
+    Ok(count)
+}
+
+/// Mux a video file + audio file into out_path by stream copy (no re-encode).
+/// Returns the number of video packets written (>=0), or -1 on error.
+#[no_mangle]
+pub extern "C" fn chuks_ffmpeg_mux(
+    video_path: *const c_char,
+    audio_path: *const c_char,
+    out_path: *const c_char,
+) -> i64 {
+    let v = match unsafe { cstr(video_path) } {
+        Some(s) => s,
+        None => {
+            set_err("mux: null video path");
+            return -1;
+        }
+    };
+    let a = match unsafe { cstr(audio_path) } {
+        Some(s) => s,
+        None => {
+            set_err("mux: null audio path");
+            return -1;
+        }
+    };
+    let o = match unsafe { cstr(out_path) } {
+        Some(s) => s,
+        None => {
+            set_err("mux: null out path");
+            return -1;
+        }
+    };
+    match mux_video_audio(v, a, o) {
+        Ok(n) => n,
+        Err(e) => {
+            set_err(format!("mux: {e}"));
+            -1
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Probe — read a file's metadata WITHOUT decoding any frames. Opens the
+// container, inspects the best video/audio streams, and caches the facts an
+// editor needs before importing a clip (size, duration, fps, codecs, audio
+// layout). Returned as an opaque handle with typed accessors (no map/JSON, so
+// VM and AOT read identical values).
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub struct Probe {
+    width: i32,
+    height: i32,
+    duration: f64,
+    fps: f64,
+    has_video: bool,
+    has_audio: bool,
+    video_codec: String,
+    audio_codec: String,
+    sample_rate: i32,
+    channels: i32,
+    bit_rate: i64,
+    nb_frames: i64,
+}
+
+fn probe_open(path: &str) -> Result<Probe, ff::Error> {
+    let _ = ff::init();
+    let ictx = ff::format::input(&path)?;
+    let mut p = Probe {
+        width: 0,
+        height: 0,
+        duration: -1.0,
+        fps: 0.0,
+        has_video: false,
+        has_audio: false,
+        video_codec: String::new(),
+        audio_codec: String::new(),
+        sample_rate: 0,
+        channels: 0,
+        bit_rate: ictx.bit_rate(),
+        nb_frames: 0,
+    };
+    let d = ictx.duration();
+    if d > 0 {
+        p.duration = d as f64 / 1_000_000.0; // AV_TIME_BASE units
+    }
+    if let Some(v) = ictx.streams().best(MediaType::Video) {
+        p.has_video = true;
+        let params = v.parameters();
+        p.video_codec = params.id().name().to_string();
+        let fr = v.avg_frame_rate();
+        if fr.denominator() != 0 {
+            p.fps = fr.numerator() as f64 / fr.denominator() as f64;
+        }
+        p.nb_frames = v.frames();
+        if let Ok(dec) = ff::codec::context::Context::from_parameters(params)
+            .and_then(|c| c.decoder().video())
+        {
+            p.width = dec.width() as i32;
+            p.height = dec.height() as i32;
+        }
+    }
+    if let Some(a) = ictx.streams().best(MediaType::Audio) {
+        p.has_audio = true;
+        let params = a.parameters();
+        p.audio_codec = params.id().name().to_string();
+        if let Ok(dec) = ff::codec::context::Context::from_parameters(params)
+            .and_then(|c| c.decoder().audio())
+        {
+            p.sample_rate = dec.rate() as i32;
+            p.channels = dec.channels() as i32;
+        }
+    }
+    Ok(p)
+}
+
+/// Probe a media file. Returns an opaque *mut Probe (free with
+/// chuks_ffmpeg_probe_free), or null on error (see chuks_ffmpeg_last_error).
+#[no_mangle]
+pub extern "C" fn chuks_ffmpeg_probe(path: *const c_char) -> *mut Probe {
+    let path = match unsafe { cstr(path) } {
+        Some(s) => s,
+        None => {
+            set_err("probe: null path");
+            return ptr::null_mut();
+        }
+    };
+    match probe_open(path) {
+        Ok(p) => Box::into_raw(Box::new(p)),
+        Err(e) => {
+            set_err(format!("probe: {e}"));
+            ptr::null_mut()
+        }
+    }
+}
+
+macro_rules! probe_getter {
+    ($name:ident, $ty:ty, $field:ident, $null:expr) => {
+        #[no_mangle]
+        pub extern "C" fn $name(p: *const Probe) -> $ty {
+            if p.is_null() {
+                return $null;
+            }
+            unsafe { (*p).$field }
+        }
+    };
+}
+probe_getter!(chuks_ffmpeg_probe_width, c_int, width, 0);
+probe_getter!(chuks_ffmpeg_probe_height, c_int, height, 0);
+probe_getter!(chuks_ffmpeg_probe_duration, f64, duration, -1.0);
+probe_getter!(chuks_ffmpeg_probe_fps, f64, fps, 0.0);
+probe_getter!(chuks_ffmpeg_probe_sample_rate, c_int, sample_rate, 0);
+probe_getter!(chuks_ffmpeg_probe_channels, c_int, channels, 0);
+probe_getter!(chuks_ffmpeg_probe_bit_rate, i64, bit_rate, 0);
+probe_getter!(chuks_ffmpeg_probe_nb_frames, i64, nb_frames, 0);
+
+#[no_mangle]
+pub extern "C" fn chuks_ffmpeg_probe_has_video(p: *const Probe) -> c_int {
+    if p.is_null() {
+        return 0;
+    }
+    if unsafe { (*p).has_video } {
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn chuks_ffmpeg_probe_has_audio(p: *const Probe) -> c_int {
+    if p.is_null() {
+        return 0;
+    }
+    if unsafe { (*p).has_audio } {
+        1
+    } else {
+        0
+    }
+}
+
+/// Video codec name (e.g. "h264"), empty if no video. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn chuks_ffmpeg_probe_video_codec(p: *const Probe) -> *mut c_char {
+    if p.is_null() {
+        return into_cstring(String::new());
+    }
+    into_cstring(unsafe { (*p).video_codec.clone() })
+}
+
+/// Audio codec name (e.g. "aac"), empty if no audio. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn chuks_ffmpeg_probe_audio_codec(p: *const Probe) -> *mut c_char {
+    if p.is_null() {
+        return into_cstring(String::new());
+    }
+    into_cstring(unsafe { (*p).audio_codec.clone() })
+}
+
+/// Free a probe handle.
+///
+/// # Safety
+/// `p` must be null or a handle from `chuks_ffmpeg_probe`, not already freed.
+#[no_mangle]
+pub unsafe extern "C" fn chuks_ffmpeg_probe_free(p: *mut Probe) {
+    if !p.is_null() {
+        drop(Box::from_raw(p));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Concat — join several media files end to end by stream copy (no re-encode),
+// the in-process equivalent of the ffmpeg concat demuxer. Inputs must share a
+// stream layout (same codecs/params, e.g. an editor's export chunks). Streams
+// are taken from the first file; each subsequent file's packet timestamps are
+// shifted by the running per-stream duration so playback is continuous. Built
+// incrementally (new -> add* -> run) to avoid passing an array across the C ABI.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub struct ConcatBuilder {
+    inputs: Vec<String>,
+}
+
+fn concat_files(inputs: &[&str], out_path: &str) -> Result<i64, ff::Error> {
+    use ff::util::mathematics::Rescale;
+    let _ = ff::init();
+    let mut octx = ff::format::output(&out_path)?;
+
+    // Define output streams from the FIRST input (copy parameters).
+    {
+        let first = ff::format::input(&inputs[0])?;
+        for st in first.streams() {
+            let params = st.parameters();
+            let mut ost = octx.add_stream(ff::encoder::find(ff::codec::Id::None))?;
+            ost.set_parameters(params);
+            unsafe {
+                (*ost.parameters().as_mut_ptr()).codec_tag = 0;
+            }
+        }
+    }
+    octx.write_header()?;
+
+    let nstreams = octx.nb_streams() as usize;
+    let out_tb: Vec<ff::Rational> = (0..nstreams)
+        .map(|i| octx.stream(i).unwrap().time_base())
+        .collect();
+
+    // A single accumulating wall-clock offset (microseconds, AV_TIME_BASE). Every
+    // stream is shifted by the SAME elapsed time, converted into its own output
+    // time base, so all streams stay in sync and dts is strictly increasing
+    // across the file boundary. Per-packet durations are unreliable on some
+    // containers, so we advance by each file's overall duration instead.
+    const US: (i32, i32) = (1, 1_000_000);
+    let mut offset_us: i64 = 0;
+    let mut count: i64 = 0;
+
+    for path in inputs {
+        let mut ictx = ff::format::input(path)?;
+        let dur_us = ictx.duration();
+        let in_tb: Vec<ff::Rational> = (0..ictx.nb_streams() as usize)
+            .map(|i| ictx.stream(i).unwrap().time_base())
+            .collect();
+
+        for (stream, mut pkt) in ictx.packets() {
+            let idx = stream.index();
+            if idx >= nstreams {
+                continue;
+            }
+            pkt.rescale_ts(in_tb[idx], out_tb[idx]);
+            let shift = offset_us.rescale(US, out_tb[idx]);
+            let new_dts = pkt.dts().map(|v| v + shift);
+            let new_pts = pkt.pts().map(|v| v + shift);
+            pkt.set_dts(new_dts);
+            pkt.set_pts(new_pts);
+            pkt.set_stream(idx);
+            pkt.set_position(-1);
+            pkt.write_interleaved(&mut octx)?;
+            count += 1;
+        }
+        if dur_us > 0 {
+            offset_us += dur_us;
+        }
+    }
+    octx.write_trailer()?;
+    Ok(count)
+}
+
+/// Start building a concat job. Free implicitly by passing to concat_run, or
+/// explicitly via concat_free if abandoned.
+#[no_mangle]
+pub extern "C" fn chuks_ffmpeg_concat_new() -> *mut ConcatBuilder {
+    Box::into_raw(Box::new(ConcatBuilder { inputs: Vec::new() }))
+}
+
+/// Append an input file to the concat job. Returns 0 ok, -1 on error.
+#[no_mangle]
+pub extern "C" fn chuks_ffmpeg_concat_add(b: *mut ConcatBuilder, path: *const c_char) -> c_int {
+    if b.is_null() {
+        set_err("concat_add: null builder");
+        return -1;
+    }
+    match unsafe { cstr(path) } {
+        Some(s) => {
+            unsafe { (*b).inputs.push(s.to_string()) };
+            0
+        }
+        None => {
+            set_err("concat_add: null path");
+            -1
+        }
+    }
+}
+
+/// Run the concat into out_path (stream copy) and FREE the builder. Returns the
+/// number of packets written (>=0), or -1 on error. The builder is invalid after.
+#[no_mangle]
+pub extern "C" fn chuks_ffmpeg_concat_run(b: *mut ConcatBuilder, out_path: *const c_char) -> i64 {
+    if b.is_null() {
+        set_err("concat_run: null builder");
+        return -1;
+    }
+    let b = unsafe { Box::from_raw(b) };
+    let out = match unsafe { cstr(out_path) } {
+        Some(s) => s,
+        None => {
+            set_err("concat_run: null out path");
+            return -1;
+        }
+    };
+    if b.inputs.is_empty() {
+        set_err("concat_run: no input files added");
+        return -1;
+    }
+    let refs: Vec<&str> = b.inputs.iter().map(|s| s.as_str()).collect();
+    match concat_files(&refs, out) {
+        Ok(n) => n,
+        Err(e) => {
+            set_err(format!("concat: {e}"));
+            -1
+        }
+    }
+}
+
+/// Free an abandoned concat builder (not needed after concat_run).
+///
+/// # Safety
+/// `b` must be null or a handle from `chuks_ffmpeg_concat_new`, not already freed.
+#[no_mangle]
+pub unsafe extern "C" fn chuks_ffmpeg_concat_free(b: *mut ConcatBuilder) {
+    if !b.is_null() {
+        drop(Box::from_raw(b));
+    }
+}

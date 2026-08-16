@@ -1,0 +1,61 @@
+// Frame encoder + mux, exercised entirely in Chuks.
+//
+// Frame encoder: decode /tmp/ff_test.mp4 (320x240 / 10fps / 10 frames) frame by
+// frame and push each RGB24 frame straight into a VideoWriter (zero-copy: the
+// reader's borrowed frame buffer, with its own stride, is handed to writeFrame).
+// The re-encoded /tmp/ff_enc.mp4 is read back to confirm 10 frames at 320x240.
+//
+// Mux: combine that silent encoded video with the audio track of /tmp/ff_av.mp4
+// (1s AAC) into /tmp/ff_muxed.mp4, then assert — in Chuks — that BOTH tracks
+// survived: openVideo() sees the 10 frames and decodeAudio() recovers ~1s of
+// 16 kHz mono PCM (~16000 samples).
+import { Ffmpeg, VideoEncoder, VideoReader, VideoWriter, AudioBuffer } from "../src/index.chuks"
+
+const DIR: string = "/Users/chukwuemekaigbokwe/Box/Code/ChuksPackages/chuks_ffmpeg"
+const ff: Ffmpeg = new Ffmpeg(DIR + "/shim")
+
+// ---- frame encoder: decode -> (borrowed RGB24) -> encode ----
+const src: VideoReader = ff.openVideo("/tmp/ff_test.mp4")
+var inW: int = 0
+var inH: int = 0
+if (src.next()) { inW = src.width(); inH = src.height() }
+
+const w: VideoWriter = ff.createVideo("/tmp/ff_enc.mp4", inW, inH, 10, VideoEncoder.H264)
+var pushed: int = 0
+// first frame already decoded above
+w.writeFrame(src.frame(), src.stride())
+pushed = pushed + 1
+while (src.next()) {
+    w.writeFrame(src.frame(), src.stride())
+    pushed = pushed + 1
+}
+const written: int = w.close()
+src.close()
+println("encoder: pushed " + string(pushed) + "  written " + string(written) + "  (" + string(inW) + "x" + string(inH) + ")")
+
+// read the encoded file back
+const chk: VideoReader = ff.openVideo("/tmp/ff_enc.mp4")
+var frames: int = 0
+var ow: int = 0
+var oh: int = 0
+while (chk.next()) {
+    frames = frames + 1
+    if (frames == 1) { ow = chk.width(); oh = chk.height() }
+}
+chk.close()
+println("encoded back: frames " + string(frames) + "  size " + string(ow) + "x" + string(oh))
+const okEnc: bool = pushed == 10 && written == 10 && frames == 10 && ow == 320 && oh == 240
+
+// ---- mux: silent encoded video + audio from ff_av.mp4 ----
+const vpkts: int = ff.mux("/tmp/ff_enc.mp4", "/tmp/ff_av.mp4", "/tmp/ff_muxed.mp4")
+const mv: VideoReader = ff.openVideo("/tmp/ff_muxed.mp4")
+var mframes: int = 0
+while (mv.next()) { mframes = mframes + 1 }
+mv.close()
+const ma: AudioBuffer = ff.decodeAudio("/tmp/ff_muxed.mp4")
+const msamples: int = ma.samples()
+ma.close()
+println("muxed: video pkts " + string(vpkts) + "  frames " + string(mframes) + "  audio " + string(msamples) + " samples")
+const okMux: bool = mframes == 10 && msamples >= 15000 && msamples <= 17000
+
+println("ENCODE OK: " + string(okEnc && okMux))

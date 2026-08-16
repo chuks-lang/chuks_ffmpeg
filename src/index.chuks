@@ -133,6 +133,95 @@ export class VideoReader {
     }
 }
 
+// A frame encoder: push rendered RGB24 frames, get an encoded video file. The
+// inverse of VideoReader, for editors that render their own frames (no shelling
+// out to an ffmpeg binary). Open with Ffmpeg.createVideo(), push frames with
+// writeFrame(), then close() to flush + finalize. Zero-copy: writeFrame borrows
+// the caller's RGB24 buffer (e.g. a VideoReader.frame()) for the call only.
+export class VideoWriter {
+    var _ff: Ffmpeg
+    var _ptr: CPtr
+    var _width: int
+    var _height: int
+    var _closed: bool
+    constructor(ff: Ffmpeg, handle: CPtr, width: int, height: int) {
+        this._ff = ff
+        this._ptr = handle
+        this._width = width
+        this._height = height
+        this._closed = false
+    }
+
+    public width(): int { return this._width }
+    public height(): int { return this._height }
+
+    // Encode one RGB24 frame. `rgb` points at width*height*3 bytes (or more with
+    // padding); `stride` is its bytes per row (0 = packed width*3). To pass a
+    // VideoReader frame straight through, use reader.frame() with reader.stride().
+    public writeFrame(rgb: CPtr, stride: int = 0): void {
+        // Use the CPtr's tagged size when known; otherwise compute it from the
+        // stride/width and height (C-received pointers report size -1).
+        var blen: int = rgb.size()
+        if (blen < 0) {
+            const s: int = stride > 0 ? stride : this._width * 3
+            blen = s * this._height
+        }
+        const rc: int = this._ff._venc_write.call([this._ptr, rgb, blen, stride])
+        if (rc < 0) { throw new Error("ffmpeg.writeFrame: " + this._ff.lastError()) }
+    }
+
+    // Flush, finalize the container, and close. Returns frames written. After
+    // close() the writer is invalid. Safe to call twice (second call is a no-op).
+    public close(): int {
+        if (this._closed) { return 0 }
+        this._closed = true
+        const n: int = this._ff._venc_close.call([this._ptr])
+        if (n < 0) { throw new Error("ffmpeg.videoWriter.close: " + this._ff.lastError()) }
+        return n
+    }
+}
+
+// Metadata about a media file, read WITHOUT decoding any frames (fast). Get one
+// from Ffmpeg.probe(); call close() when done (or bind it with `using const` so
+// the compiler closes it for you). All accessors are typed, so VM and AOT report
+// identical values.
+export class MediaInfo {
+    var _ff: Ffmpeg
+    var _ptr: CPtr
+    var _closed: bool
+    constructor(ff: Ffmpeg, handle: CPtr) {
+        this._ff = ff
+        this._ptr = handle
+        this._closed = false
+    }
+
+    public hasVideo(): bool { return this._ff._probe_has_video.call([this._ptr]) == 1 }
+    public hasAudio(): bool { return this._ff._probe_has_audio.call([this._ptr]) == 1 }
+    // Video frame size in pixels (0 if no video stream).
+    public width(): int { return this._ff._probe_width.call([this._ptr]) }
+    public height(): int { return this._ff._probe_height.call([this._ptr]) }
+    // Container duration in seconds (-1 if unknown).
+    public duration(): float { return this._ff._probe_duration.call([this._ptr]) }
+    // Average video frame rate in fps (0 if no video / unknown).
+    public fps(): float { return this._ff._probe_fps.call([this._ptr]) }
+    // Number of video frames if the container records it (0 if unknown).
+    public frameCount(): int { return this._ff._probe_nb_frames.call([this._ptr]) }
+    // Overall container bitrate in bits/sec (0 if unknown).
+    public bitRate(): int { return this._ff._probe_bit_rate.call([this._ptr]) }
+    // Audio sample rate in Hz and channel count (0 if no audio stream).
+    public sampleRate(): int { return this._ff._probe_sample_rate.call([this._ptr]) }
+    public channels(): int { return this._ff._probe_channels.call([this._ptr]) }
+    // Codec short names, e.g. "h264" / "aac" (empty if that stream is absent).
+    public videoCodec(): string { return this._ff._readAndFreeStr(this._ff._probe_video_codec.call([this._ptr])) }
+    public audioCodec(): string { return this._ff._readAndFreeStr(this._ff._probe_audio_codec.call([this._ptr])) }
+
+    public close(): void {
+        if (this._closed) { return }
+        this._closed = true
+        this._ff._probe_free.call([this._ptr])
+    }
+}
+
 export class Ffmpeg {
     var _lib: LibHandle
     var _version: CFunc
@@ -156,6 +245,28 @@ export class Ffmpeg {
     var _transcode: CFunc
     var _last_video_encoder: CFunc
     var _has_encoder: CFunc
+    var _venc_open: CFunc
+    var _venc_write: CFunc
+    var _venc_close: CFunc
+    var _mux: CFunc
+    var _probe: CFunc
+    var _probe_width: CFunc
+    var _probe_height: CFunc
+    var _probe_duration: CFunc
+    var _probe_fps: CFunc
+    var _probe_has_video: CFunc
+    var _probe_has_audio: CFunc
+    var _probe_video_codec: CFunc
+    var _probe_audio_codec: CFunc
+    var _probe_sample_rate: CFunc
+    var _probe_channels: CFunc
+    var _probe_bit_rate: CFunc
+    var _probe_nb_frames: CFunc
+    var _probe_free: CFunc
+    var _concat_new: CFunc
+    var _concat_add: CFunc
+    var _concat_run: CFunc
+    var _concat_free: CFunc
 
     constructor(shimManifestDir: string = "chuks_packages/@chuks/ffmpeg") {
         const libPath: string = r.cargoBuild(shimManifestDir, true)
@@ -183,6 +294,28 @@ export class Ffmpeg {
         this._transcode = L.symbol("chuks_ffmpeg_transcode", new CSig([CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING], CSig.T_INT64))
         this._last_video_encoder = L.symbol("chuks_ffmpeg_last_video_encoder", new CSig([], CSig.T_PTR))
         this._has_encoder = L.symbol("chuks_ffmpeg_has_encoder", new CSig([CSig.T_CSTRING], CSig.T_INT))
+        this._venc_open = L.symbol("chuks_ffmpeg_venc_open", new CSig([CSig.T_CSTRING, CSig.T_INT, CSig.T_INT, CSig.T_INT, CSig.T_INT, CSig.T_CSTRING], CSig.T_PTR))
+        this._venc_write = L.symbol("chuks_ffmpeg_venc_write", new CSig([CSig.T_PTR, CSig.T_PTR, CSig.T_INT, CSig.T_INT], CSig.T_INT))
+        this._venc_close = L.symbol("chuks_ffmpeg_venc_close", new CSig([CSig.T_PTR], CSig.T_INT64))
+        this._mux = L.symbol("chuks_ffmpeg_mux", new CSig([CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING], CSig.T_INT64))
+        this._probe = L.symbol("chuks_ffmpeg_probe", new CSig([CSig.T_CSTRING], CSig.T_PTR))
+        this._probe_width = L.symbol("chuks_ffmpeg_probe_width", new CSig([CSig.T_PTR], CSig.T_INT))
+        this._probe_height = L.symbol("chuks_ffmpeg_probe_height", new CSig([CSig.T_PTR], CSig.T_INT))
+        this._probe_duration = L.symbol("chuks_ffmpeg_probe_duration", new CSig([CSig.T_PTR], CSig.T_DOUBLE))
+        this._probe_fps = L.symbol("chuks_ffmpeg_probe_fps", new CSig([CSig.T_PTR], CSig.T_DOUBLE))
+        this._probe_has_video = L.symbol("chuks_ffmpeg_probe_has_video", new CSig([CSig.T_PTR], CSig.T_INT))
+        this._probe_has_audio = L.symbol("chuks_ffmpeg_probe_has_audio", new CSig([CSig.T_PTR], CSig.T_INT))
+        this._probe_video_codec = L.symbol("chuks_ffmpeg_probe_video_codec", new CSig([CSig.T_PTR], CSig.T_PTR))
+        this._probe_audio_codec = L.symbol("chuks_ffmpeg_probe_audio_codec", new CSig([CSig.T_PTR], CSig.T_PTR))
+        this._probe_sample_rate = L.symbol("chuks_ffmpeg_probe_sample_rate", new CSig([CSig.T_PTR], CSig.T_INT))
+        this._probe_channels = L.symbol("chuks_ffmpeg_probe_channels", new CSig([CSig.T_PTR], CSig.T_INT))
+        this._probe_bit_rate = L.symbol("chuks_ffmpeg_probe_bit_rate", new CSig([CSig.T_PTR], CSig.T_INT64))
+        this._probe_nb_frames = L.symbol("chuks_ffmpeg_probe_nb_frames", new CSig([CSig.T_PTR], CSig.T_INT64))
+        this._probe_free = L.symbol("chuks_ffmpeg_probe_free", new CSig([CSig.T_PTR], CSig.T_VOID))
+        this._concat_new = L.symbol("chuks_ffmpeg_concat_new", new CSig([], CSig.T_PTR))
+        this._concat_add = L.symbol("chuks_ffmpeg_concat_add", new CSig([CSig.T_PTR, CSig.T_CSTRING], CSig.T_INT))
+        this._concat_run = L.symbol("chuks_ffmpeg_concat_run", new CSig([CSig.T_PTR, CSig.T_CSTRING], CSig.T_INT64))
+        this._concat_free = L.symbol("chuks_ffmpeg_concat_free", new CSig([CSig.T_PTR], CSig.T_VOID))
     }
 
     // FFmpeg build version string.
@@ -252,6 +385,68 @@ export class Ffmpeg {
     // "h264_videotoolbox"). Probe hardware support without attempting an encode.
     public hasEncoder(name: string): bool {
         return this._has_encoder.call([name]) == 1
+    }
+
+    // Open a frame encoder writing to `outPath`. Frames are `width`x`height`
+    // RGB24, pushed via VideoWriter.writeFrame(); `fps` sets the timebase (num/
+    // den defaults to fps/1). `encoder` is the codec family (default hardware
+    // H.264), resolved to the best encoder for this platform. The container is
+    // chosen from the output extension (.mp4/.mov/.mkv...). Throws on error.
+    public createVideo(outPath: string, width: int, height: int, fps: int = 30, encoder: VideoEncoder = VideoEncoder.H264): VideoWriter {
+        var name: string = "mpeg4"
+        if (encoder == VideoEncoder.H264) { name = "h264" }
+        else if (encoder == VideoEncoder.HEVC) { name = "hevc" }
+        else if (encoder == VideoEncoder.MJPEG) { name = "mjpeg" }
+        const raw: any = this._venc_open.call([outPath, width, height, fps, 1, name])
+        const p: CPtr = new CPtr(raw, false, -1)
+        if (p.isNull()) {
+            throw new Error("ffmpeg.createVideo: " + this.lastError())
+        }
+        return new VideoWriter(this, p, width, height)
+    }
+
+    // Mux a video file and an audio file into `outPath` by stream copy (no
+    // re-encode). Pairs with createVideo(): render frames to a silent video,
+    // then add the timeline's audio track. Returns the number of video packets
+    // written. Throws on error.
+    public mux(videoPath: string, audioPath: string, outPath: string): int {
+        const n: int = this._mux.call([videoPath, audioPath, outPath])
+        if (n < 0) { throw new Error("ffmpeg.mux: " + this.lastError()) }
+        return n
+    }
+
+    // Read a file's metadata (size, duration, fps, codecs, audio layout) WITHOUT
+    // decoding any frames: opens the container, inspects the best video/audio
+    // streams, and returns a MediaInfo. Cheap enough to call on every import.
+    // close() the result (or bind with `using const`). Throws on error.
+    public probe(path: string): MediaInfo {
+        const raw: any = this._probe.call([path])
+        const p: CPtr = new CPtr(raw, false, -1)
+        if (p.isNull()) {
+            throw new Error("ffmpeg.probe: " + this.lastError())
+        }
+        return new MediaInfo(this, p)
+    }
+
+    // Join media files end to end into `outPath` by stream copy (no re-encode),
+    // the in-process equivalent of the ffmpeg concat demuxer. Inputs must share
+    // a stream layout (same codecs/params) — e.g. an editor's export chunks;
+    // each file's timestamps are shifted so playback stays continuous. Returns
+    // the number of packets written. Throws on error.
+    public concat(paths: []string, outPath: string): int {
+        const raw: any = this._concat_new.call([])
+        const b: CPtr = new CPtr(raw, false, -1)
+        if (b.isNull()) { throw new Error("ffmpeg.concat: " + this.lastError()) }
+        for (var i: int = 0; i < paths.length; i = i + 1) {
+            const rc: int = this._concat_add.call([b, paths[i]])
+            if (rc < 0) {
+                this._concat_free.call([b])
+                throw new Error("ffmpeg.concat: " + this.lastError())
+            }
+        }
+        const n: int = this._concat_run.call([b, outPath])
+        if (n < 0) { throw new Error("ffmpeg.concat: " + this.lastError()) }
+        return n
     }
 
     // Last error message from the shim.
