@@ -1,6 +1,6 @@
 {
   "name": "@chuks/ffmpeg",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "FFmpeg for Chuks: a self-contained Rust cdylib shim over the ffmpeg-next crate (libav) for decoding, encoding, transcoding, filtering, and resampling media natively. Foundation for real-time streaming (@chuks/stream) and the @chuks/whisper live-caption audio tap.",
   "entry": "src/index.chuks",
   "author": "Chuks Team",

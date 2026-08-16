@@ -373,7 +373,7 @@ ff.saveImage(rgbPtr, width, height, "frame.jpg", stride)
 
 Image sequences carry no audio; add a soundtrack afterwards with `mux`. Output
 format follows the extension: **JPEG** (`.jpg`), BMP, TIFF. *(PNG needs zlib and
-lands in 0.1.3.)*
+lands in 0.1.4.)*
 
 ## GIF — `toGif`
 
