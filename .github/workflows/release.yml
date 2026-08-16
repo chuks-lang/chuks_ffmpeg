@@ -244,125 +244,92 @@ jobs:
             cat /tmp/pub.log; exit 1
           fi
 
-  # windows-x86_64 prebuilt via the MSVC toolchain. ffmpeg-sys-next builds FFmpeg
-  # by running `sh configure --toolchain=msvc` (so it uses cl.exe, not gcc) and
-  # does NOT force --enable-pthreads on MSVC — which sidesteps the MinGW gcc-16 /
-  # pthreads dead-end. Requirements: cl.exe (msvc-dev-cmd), `sh` + coreutils that
-  # configure calls (Git's usr/bin), nasm (x86 asm), and libclang (rust-bindgen).
-  # PATH-ORDER TRAP: Git's usr/bin ships a `link.exe` (coreutils) that shadows
-  # MSVC's linker. We add Git's tools BEFORE msvc-dev-cmd so MSVC's cl.exe/link.exe
-  # end up first on PATH. Experimental, gated behind build_windows, non-blocking.
+
+  # windows-x86_64 prebuilt by CROSS-COMPILING from Linux with MinGW-w64 — the
+  # same method FFmpeg's own official Windows binaries (BtbN) use. FFmpeg's
+  # configure/make/awk run as native Linux tools here, so none of the
+  # Windows-native shell breakage applies (backslash-eating awk, Git's link.exe
+  # shadowing MSVC, the winpthreads dance). ffmpeg-sys-next auto-detects
+  # host != target and adds --enable-cross-compile + --cross-prefix.
+  # Gated behind build_windows so it never blocks a normal release.
   publish-prebuilt-windows:
-    name: prebuilt windows-x86_64 (experimental)
+    name: prebuilt windows-x86_64
     needs: [setup, publish-source]
     if: ${{ github.event.inputs.build_windows == 'true' }}
     continue-on-error: true
-    runs-on: windows-2022
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      # FFmpeg's configure needs Git's Unix tools (sh, grep, sed, awk, ...), but
-      # Git's usr/bin also ships a coreutils `link.exe` that shadows MSVC's linker
-      # no matter the PATH order — which breaks rustc ("link.exe failed"). Delete
-      # that one file (configure never uses it) so the only link.exe is MSVC's,
-      # then put Git's tools on PATH for `sh`.
-      - name: Add Git Unix tools to PATH (minus its link.exe)
-        shell: pwsh
+      - name: Install MinGW-w64 cross toolchain + FFmpeg build deps
+        shell: bash
         run: |
-          Remove-Item "C:\Program Files\Git\usr\bin\link.exe" -Force -ErrorAction SilentlyContinue
-          if (Test-Path "C:\Program Files\Git\usr\bin\link.exe") {
-            throw "Could not remove Git's link.exe (would shadow MSVC linker)"
-          }
-          # The runner's git defaults to autocrlf=true, so ffmpeg-sys-next's clone
-          # of FFmpeg would get CRLF line endings that break awk/sh/make during the
-          # build. Force LF.
-          git config --global core.autocrlf false
-          git config --global core.eol lf
-          echo "C:\Program Files\Git\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 mingw-w64-tools \
+            nasm yasm make pkg-config clang libclang-dev
+          x86_64-w64-mingw32-gcc --version | head -1
 
-      - name: Set up MSVC (cl.exe) environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Install nasm + make + point bindgen at libclang
-        shell: pwsh
-        run: |
-          # GNU make: FFmpeg's Makefiles run recipes (incl. the awk dep-gen that
-          # uses gsub(/\\/,"/")) through a shell. GNU make uses sh when it finds
-          # sh.exe (Git's, on PATH); a make that falls back to cmd.exe strips a
-          # backslash level and corrupts that awk regex ("^ syntax error").
-          choco install make nasm --no-progress -y
-          echo "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          if (-not (Test-Path "C:\Program Files\LLVM\bin\libclang.dll")) {
-            choco install llvm --no-progress -y
-          }
-          echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: Install Rust toolchain (MSVC)
+      - name: Install Rust toolchain (windows-gnu target)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-gnu
 
-      # IMPORTANT: build in pwsh, NOT bash. Git-bash prepends its own /usr/bin to
-      # PATH internally, so rustc/FFmpeg would pick Git's coreutils `link.exe`
-      # instead of MSVC's linker ("link.exe failed" on the host build scripts).
-      # pwsh respects the Windows PATH order (MSVC first, Git's sh available after).
-      - name: Build shim (FFmpeg from source, MSVC toolchain)
-        shell: pwsh
+      - name: Cross-compile shim (FFmpeg from source) for Windows
+        shell: bash
         env:
-          # ffmpeg-sys-next defaults to GCC flags -march=native -mtune=native,
-          # which MSVC's cl.exe rejects (D8043). Empty = omit them. Also makes
-          # the prebuilt portable (not tuned to this runner's CPU).
+          # Portable + avoids gcc-only flags; empty omits -march/-mtune.
           FFMPEG_MARCH: ""
           FFMPEG_MTUNE: ""
+          # Static-link the MinGW runtime into the .dll so it is self-contained
+          # (no libgcc_s / libwinpthread / libstdc++ DLL deps). Target-scoped so
+          # host build scripts (compiled for linux) are unaffected.
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS: "-C target-feature=+crt-static"
+          # Point bindgen's clang at the mingw target when parsing FFmpeg headers.
+          BINDGEN_EXTRA_CLANG_ARGS: "--target=x86_64-w64-mingw32"
         run: |
-          Write-Host "cl:   $((Get-Command cl.exe   -ErrorAction SilentlyContinue).Source)"
-          Write-Host "link: $((Get-Command link.exe -ErrorAction SilentlyContinue).Source)  (must be MSVC, not Git)"
-          Write-Host "sh:   $((Get-Command sh.exe   -ErrorAction SilentlyContinue).Source)"
-          Write-Host "nasm: $((Get-Command nasm.exe -ErrorAction SilentlyContinue).Source)"
-          cargo build --release --manifest-path shim/Cargo.toml --target x86_64-pc-windows-msvc
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "===== build failed — dumping FFmpeg config.log tail ====="
-            Get-ChildItem -Recurse -Path shim/target -Filter config.log -ErrorAction SilentlyContinue |
-              Where-Object { $_.FullName -like "*ffmpeg*" } |
-              ForEach-Object { Write-Host "----- $($_.FullName) -----"; Get-Content -Tail 80 $_.FullName }
+          set -uo pipefail
+          if ! cargo build --release --manifest-path shim/Cargo.toml --target x86_64-pc-windows-gnu; then
+            echo "===== build failed — dumping FFmpeg config.log tail ====="
+            find shim/target -name config.log -path "*ffmpeg*" 2>/dev/null | while read -r f; do
+              echo "----- $f -----"; tail -n 80 "$f"
+            done
             exit 1
-          }
+          fi
 
       - name: Locate produced DLL
         id: locate
         shell: bash
         run: |
           set -euo pipefail
-          DIR="shim/target/x86_64-pc-windows-msvc/release"
+          DIR="shim/target/x86_64-pc-windows-gnu/release"
           FILE=$(find "$DIR" -maxdepth 1 -type f -name "*.dll" ! -name "*.d.dll" | head -n 1)
-          if [[ -z "$FILE" ]]; then
-            echo "::error::No .dll found in $DIR" >&2; ls -la "$DIR" || true; exit 1
-          fi
+          [ -n "$FILE" ] || { echo "::error::No .dll in $DIR"; ls -la "$DIR" || true; exit 1; }
           echo "file=$FILE" >> "$GITHUB_OUTPUT"
           echo "Built: $FILE"
+          echo "DLL imports (want only system DLLs — no libav*/libgcc/libwinpthread):"
+          x86_64-w64-mingw32-objdump -p "$FILE" | grep -i "DLL Name" || true
 
-      - name: Install chuks CLI
+      - name: Install chuks CLI (linux)
         shell: bash
         env:
           CHUKS_VERSION: ${{ needs.setup.outputs.chuks_version }}
         run: |
           set -euo pipefail
-          BASE="chuks-windows-amd64"
+          BASE="chuks-linux-amd64"
           REPO="chuks-programming-language/releases"
           if [[ "$CHUKS_VERSION" == "latest" ]]; then
-            URL="https://github.com/$REPO/releases/latest/download/${BASE}.zip"
+            URL="https://github.com/$REPO/releases/latest/download/${BASE}.tar.gz"
           else
-            URL="https://github.com/$REPO/releases/download/${CHUKS_VERSION}/${BASE}.zip"
+            URL="https://github.com/$REPO/releases/download/${CHUKS_VERSION}/${BASE}.tar.gz"
           fi
-          curl -fsSL -o /tmp/chuks.zip "$URL"
-          mkdir -p /tmp/chuks-extract "$HOME/chuks/bin"
-          unzip -o /tmp/chuks.zip -d /tmp/chuks-extract
-          cp /tmp/chuks-extract/"$BASE"/chuks* "$HOME/chuks/bin/" 2>/dev/null \
-            || cp /tmp/chuks-extract/chuks* "$HOME/chuks/bin/"
+          curl -fsSL "$URL" | tar -xz -C /tmp
+          mkdir -p "$HOME/chuks/bin"
+          if [[ -d "/tmp/${BASE}" ]]; then cp "/tmp/${BASE}/chuks" "$HOME/chuks/bin/chuks"; else cp /tmp/chuks "$HOME/chuks/bin/chuks"; fi
+          chmod +x "$HOME/chuks/bin/chuks"
           echo "$HOME/chuks/bin" >> "$GITHUB_PATH"
-          "$HOME/chuks/bin/chuks.exe" --version || true
+          "$HOME/chuks/bin/chuks" --version || true
 
       - name: Publish prebuilt
         shell: bash
@@ -370,8 +337,7 @@ jobs:
           CHUKS_TOKEN: ${{ secrets.CHUKS_TOKEN }}
         run: |
           set -euo pipefail
-          CHUKS="$HOME/chuks/bin/chuks.exe"
-          if "$CHUKS" publish --prebuilt-only --platform windows-x86_64 \
+          if chuks publish --prebuilt-only --platform windows-x86_64 \
                --file "${{ steps.locate.outputs.file }}" 2>&1 | tee /tmp/pub.log; then
             echo "Published windows-x86_64."
           elif grep -qi "already exists\|409" /tmp/pub.log; then
