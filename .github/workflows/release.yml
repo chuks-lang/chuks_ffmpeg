@@ -269,6 +269,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 mingw-w64-tools \
             nasm yasm make pkg-config clang libclang-dev
+          # Debian's mingw gcc defaults to the win32 threading model, which has no
+          # pthreads — but ffmpeg-sys-next forces --enable-pthreads. Switch to the
+          # posix variant (ships winpthreads) so FFmpeg's pthread check passes.
+          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
+          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
           x86_64-w64-mingw32-gcc --version | head -1
 
       - name: Install Rust toolchain (windows-gnu target)
