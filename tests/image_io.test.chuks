@@ -1,0 +1,33 @@
+// Image I/O: decode -> save numbered JPEGs (saveFrame) -> encode the sequence
+// back to mp4 (encodeImages, with a scale filter + faststart). Also a PNG save.
+import { Ffmpeg, VideoEncoder, VideoReader, EncodeOptions } from "../src/index.chuks"
+import { fs } from "std/fs"
+const DIR: string = "/Users/chukwuemekaigbokwe/Box/Code/ChuksPackages/chuks_ffmpeg"
+const ff: Ffmpeg = new Ffmpeg(DIR + "/shim")
+
+const dir: string = "/tmp/ffimg"
+if (!fs.exists(dir)) { fs.mkdir(dir) }
+
+// 1. decode ff_test.mp4 (320x240, 10 frames) -> numbered JPEGs.
+using const src = ff.openVideo("/tmp/ff_test.mp4")
+var i: int = 0
+while (src.next()) {
+    var name: string = string(i)
+    while (name.length < 6) { name = "0" + name }
+    src.saveFrame(fs.join(dir, name + ".jpg"))
+    i = i + 1
+}
+println("saved " + string(i) + " jpegs")
+const okSave: bool = i == 10 && fs.exists(fs.join(dir, "000000.jpg"))
+
+// 2. encode the image sequence back -> mp4 (scale to 160x120 + faststart).
+const opts: EncodeOptions = new EncodeOptions().faststart().videoBitrate(4000000)
+const n: int = ff.encodeImages(fs.join(dir, "%06d.jpg"), "/tmp/ff_fromimg.mp4", 10, VideoEncoder.H264, "scale=160:120", opts)
+using const chk = ff.openVideo("/tmp/ff_fromimg.mp4")
+var frames: int = 0
+var w: int = 0
+while (chk.next()) { frames = frames + 1; if (frames == 1) { w = chk.width() } }
+println("encoded from images: n=" + string(n) + " frames=" + string(frames) + " w=" + string(w))
+const okEnc: bool = n == 10 && frames == 10 && w == 160
+
+println("IMAGE IO OK: " + string(okSave && okEnc))

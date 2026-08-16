@@ -790,27 +790,110 @@ fn build_audio_filter(
     Ok(g)
 }
 
+// Encoder / muxer options, parsed from a compact "k=v;k=v" spec built by the
+// Chuks EncodeOptions class (AVDictionary-style, so new keys never churn the C
+// ABI). Every field is optional; 0 / None / false means "leave the default".
+#[derive(Default)]
+struct EncodeOpts {
+    vbitrate: usize,        // video bit rate, bits/sec (0 = codec default / CRF)
+    gop: u32,               // keyframe interval in frames (0 = default)
+    crf: Option<String>,    // constant-quality value for x264/vpx (as a string)
+    preset: Option<String>, // encoder preset, e.g. "veryfast"
+    drop_audio: bool,       // -an: no audio track in the output
+    acodec: Option<String>, // override audio handling ("aac"/"copy"/...)
+    abitrate: usize,        // audio bit rate, bits/sec (0 = default)
+    format: Option<String>, // force output muxer, e.g. "mp4" (extensionless out)
+    faststart: bool,        // mp4 moov-atom at front (movflags +faststart)
+    shortest: bool,         // finish at the shortest stream when muxing
+    fps: i32,               // output frame rate override (0 = keep input's)
+    out_pix: Option<String>, // filtergraph output pixel format (default yuv420p)
+}
+
+fn parse_encode_opts(spec: &str) -> EncodeOpts {
+    let mut o = EncodeOpts::default();
+    for kv in spec.split(';') {
+        let kv = kv.trim();
+        if kv.is_empty() {
+            continue;
+        }
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        let on = v == "1" || v == "true";
+        match k {
+            "vbitrate" => o.vbitrate = v.parse().unwrap_or(0),
+            "gop" => o.gop = v.parse().unwrap_or(0),
+            "crf" if !v.is_empty() => o.crf = Some(v.to_string()),
+            "preset" if !v.is_empty() => o.preset = Some(v.to_string()),
+            "an" => o.drop_audio = on,
+            "acodec" if !v.is_empty() => o.acodec = Some(v.to_string()),
+            "abitrate" => o.abitrate = v.parse().unwrap_or(0),
+            "format" if !v.is_empty() => o.format = Some(v.to_string()),
+            "faststart" => o.faststart = on,
+            "shortest" => o.shortest = on,
+            "fps" => o.fps = v.parse().unwrap_or(0),
+            "outpix" if !v.is_empty() => o.out_pix = Some(v.to_string()),
+            _ => {}
+        }
+    }
+    o
+}
+
+// Build the crf/preset private-option dictionary for a software encoder (empty
+// if neither is set). Unknown keys are harmless: hardware encoders ignore them.
+fn encoder_priv_opts(o: &EncodeOpts) -> Option<ff::Dictionary<'static>> {
+    if o.crf.is_none() && o.preset.is_none() {
+        return None;
+    }
+    let mut d = ff::Dictionary::new();
+    if let Some(crf) = &o.crf {
+        d.set("crf", crf);
+    }
+    if let Some(preset) = &o.preset {
+        d.set("preset", preset);
+    }
+    Some(d)
+}
+
 fn transcode_inner(
     in_path: &str,
     out_path: &str,
     encoder_name: &str,
     filter_spec: &str,
     audio_codec: &str,
+    opts_spec: &str,
+    input_framerate: i32,
 ) -> Result<i64, ff::Error> {
     let _ = ff::init();
+    let o = parse_encode_opts(opts_spec);
+    // An explicit acodec in the options overrides the `audio_codec` argument.
+    let audio_codec: &str = o.acodec.as_deref().unwrap_or(audio_codec);
     // "" / "copy" => stream-copy the audio; any other value names an audio
     // encoder to re-encode to (e.g. "aac").
     let want_reencode = !audio_codec.is_empty() && audio_codec != "copy";
 
     // ---- input / decoder ----
-    let mut ictx = ff::format::input(&in_path)?;
+    // input_framerate > 0 => open `in_path` as an image sequence (image2 demuxer,
+    // e.g. "frames/%06d.jpg") at that fps; otherwise a normal media file.
+    let mut ictx = if input_framerate > 0 {
+        let mut d = ff::Dictionary::new();
+        d.set("framerate", &input_framerate.to_string());
+        ff::format::input_with_dictionary(&in_path, d)?
+    } else {
+        ff::format::input(&in_path)?
+    };
     let stream = ictx
         .streams()
         .best(MediaType::Video)
         .ok_or(ff::Error::StreamNotFound)?;
     let vindex = stream.index();
     let time_base = stream.time_base();
-    let fps = {
+    // Output fps: an explicit opts fps wins (e.g. a gif at 15), else the image
+    // sequence rate, else the input stream's rate. The encoder time base and the
+    // filtergraph frame_rate both use this, so a filter `fps=N` stays consistent.
+    let fps = if o.fps > 0 {
+        ff::Rational::new(o.fps, 1)
+    } else if input_framerate > 0 {
+        ff::Rational::new(input_framerate, 1)
+    } else {
         let r = stream.rate();
         if r.numerator() > 0 && r.denominator() > 0 {
             r
@@ -824,7 +907,12 @@ fn transcode_inner(
         .video()?;
 
     // ---- output context + encoder codec (encoder opened lazily) ----
-    let mut octx = ff::format::output(&out_path)?;
+    // Force the muxer when a format is given (e.g. an extensionless output path
+    // that ffmpeg can't infer a container for).
+    let mut octx = match &o.format {
+        Some(f) => ff::format::output_as(&out_path, f)?,
+        None => ff::format::output(&out_path)?,
+    };
     let codec = resolve_video_encoder(encoder_name).ok_or(ff::Error::EncoderNotFound)?;
     let global_header = octx
         .format()
@@ -856,7 +944,13 @@ fn transcode_inner(
     let mut a_filter: Option<ff::filter::Graph> = None;
     let mut a_dec_frame = AudioFrame::empty();
     let mut a_filt_frame = AudioFrame::empty();
-    if let Some(astream) = ictx.streams().best(MediaType::Audio) {
+    // `.filter(|_| !o.drop_audio)` => a requested -an drops the audio track: the
+    // whole audio setup is skipped and a_in_index stays -1, so nothing is muxed.
+    if let Some(astream) = ictx
+        .streams()
+        .best(MediaType::Audio)
+        .filter(|_| !o.drop_audio)
+    {
         a_in_index = astream.index() as i64;
         let a_in_tb = astream.time_base();
         let aparams = astream.parameters();
@@ -884,8 +978,13 @@ fn transcode_inner(
                     .and_then(|mut f| f.next())
                     .ok_or(ff::Error::EncoderNotFound)?,
             );
-            let br = dec.bit_rate();
-            aenc.set_bit_rate(if br > 0 { br } else { 128_000 });
+            let br = if o.abitrate > 0 {
+                o.abitrate
+            } else {
+                let b = dec.bit_rate();
+                if b > 0 { b } else { 128_000 }
+            };
+            aenc.set_bit_rate(br);
             aenc.set_time_base((1, dec.rate() as i32));
             let opened_enc = aenc.open_as(acodec)?;
             aout.set_parameters(&opened_enc);
@@ -960,16 +1059,31 @@ fn transcode_inner(
                 enc.set_format(filt_frame.format()); // yuv420p (graph output)
                 enc.set_time_base(fps.invert());
                 enc.set_frame_rate(Some(fps));
+                if o.vbitrate > 0 {
+                    enc.set_bit_rate(o.vbitrate);
+                }
+                if o.gop > 0 {
+                    enc.set_gop(o.gop);
+                }
                 if global_header {
                     enc.set_flags(ff::codec::flag::Flags::GLOBAL_HEADER);
                 }
-                let enc_opened = enc.open()?;
+                let enc_opened = match encoder_priv_opts(&o) {
+                    Some(d) => enc.open_with(d)?,
+                    None => enc.open()?,
+                };
                 {
                     let mut ost = octx.stream_mut(ost_index).unwrap();
                     ost.set_parameters(&enc_opened);
                     ost.set_time_base(fps.invert());
                 }
-                octx.write_header()?;
+                if o.faststart {
+                    let mut d = ff::Dictionary::new();
+                    d.set("movflags", "+faststart");
+                    octx.write_header_with(d)?;
+                } else {
+                    octx.write_header()?;
+                }
                 ost_tb = octx.stream(ost_index).unwrap().time_base();
                 enc_tb = enc_opened.time_base();
                 opened = Some(enc_opened);
@@ -1030,10 +1144,11 @@ fn transcode_inner(
         () => {{
             while decoder.receive_frame(&mut dec_frame).is_ok() {
                 if filter.is_none() {
+                    let out_pix = o.out_pix.as_deref().unwrap_or("yuv420p");
                     filter = Some(build_video_filter(
                         &dec_frame,
                         filter_spec,
-                        "yuv420p",
+                        out_pix,
                         time_base,
                         fps,
                     )?);
@@ -1186,6 +1301,7 @@ pub extern "C" fn chuks_ffmpeg_transcode(
     encoder: *const c_char,
     filter: *const c_char,
     audio: *const c_char,
+    opts: *const c_char,
 ) -> i64 {
     let inp = match unsafe { cstr(in_path) } {
         Some(s) => s.to_string(),
@@ -1210,10 +1326,52 @@ pub extern "C" fn chuks_ffmpeg_transcode(
     };
     let filt = unsafe { cstr(filter) }.unwrap_or("").to_string();
     let aud = unsafe { cstr(audio) }.unwrap_or("").to_string();
-    match transcode_inner(&inp, &outp, &enc, &filt, &aud) {
+    let optspec = unsafe { cstr(opts) }.unwrap_or("").to_string();
+    match transcode_inner(&inp, &outp, &enc, &filt, &aud, &optspec, 0) {
         Ok(n) => n,
         Err(e) => {
             set_err(format!("transcode: {e}"));
+            -1
+        }
+    }
+}
+
+/// Encode a numbered image sequence (image2 demuxer, e.g. "frames/%06d.jpg") to
+/// a video at `fps`. Same pipeline as transcode (filter + EncodeOptions apply);
+/// image sequences carry no audio, so mux a soundtrack afterwards with
+/// chuks_ffmpeg_mux. Returns frames written, -1 on error.
+#[no_mangle]
+pub extern "C" fn chuks_ffmpeg_encode_images(
+    pattern: *const c_char,
+    out_path: *const c_char,
+    encoder: *const c_char,
+    filter: *const c_char,
+    opts: *const c_char,
+    fps: c_int,
+) -> i64 {
+    let pat = match unsafe { cstr(pattern) } {
+        Some(s) => s.to_string(),
+        None => {
+            set_err("encode_images: null pattern");
+            return -1;
+        }
+    };
+    let outp = match unsafe { cstr(out_path) } {
+        Some(s) => s.to_string(),
+        None => {
+            set_err("encode_images: null out_path");
+            return -1;
+        }
+    };
+    let enc = unsafe { cstr(encoder) }.unwrap_or("h264").to_string();
+    let filt = unsafe { cstr(filter) }.unwrap_or("").to_string();
+    let optspec = unsafe { cstr(opts) }.unwrap_or("").to_string();
+    let f = if fps > 0 { fps } else { 30 };
+    // Image sequences have no audio track ("" => nothing to stream-copy).
+    match transcode_inner(&pat, &outp, &enc, &filt, "", &optspec, f) {
+        Ok(n) => n,
+        Err(e) => {
+            set_err(format!("encode_images: {e}"));
             -1
         }
     }
@@ -1252,14 +1410,19 @@ fn video_writer_open(
     fps_num: i32,
     fps_den: i32,
     encoder_name: &str,
+    opts_spec: &str,
 ) -> Result<VideoWriter, ff::Error> {
     let _ = ff::init();
+    let o = parse_encode_opts(opts_spec);
     let fps = if fps_num > 0 && fps_den > 0 {
         ff::Rational::new(fps_num, fps_den)
     } else {
         ff::Rational::new(30, 1)
     };
-    let mut octx = ff::format::output(&path)?;
+    let mut octx = match &o.format {
+        Some(f) => ff::format::output_as(&path, f)?,
+        None => ff::format::output(&path)?,
+    };
     let codec = resolve_video_encoder(encoder_name).ok_or(ff::Error::EncoderNotFound)?;
     let global_header = octx
         .format()
@@ -1274,10 +1437,19 @@ fn video_writer_open(
     enc.set_format(Pixel::YUV420P);
     enc.set_time_base(fps.invert());
     enc.set_frame_rate(Some(fps));
+    if o.vbitrate > 0 {
+        enc.set_bit_rate(o.vbitrate);
+    }
+    if o.gop > 0 {
+        enc.set_gop(o.gop);
+    }
     if global_header {
         enc.set_flags(ff::codec::flag::Flags::GLOBAL_HEADER);
     }
-    let encoder = enc.open()?;
+    let encoder = match encoder_priv_opts(&o) {
+        Some(d) => enc.open_with(d)?,
+        None => enc.open()?,
+    };
 
     let ost_index = {
         let mut ost = octx.add_stream(codec)?;
@@ -1285,7 +1457,13 @@ fn video_writer_open(
         ost.set_time_base(fps.invert());
         ost.index()
     };
-    octx.write_header()?;
+    if o.faststart {
+        let mut d = ff::Dictionary::new();
+        d.set("movflags", "+faststart");
+        octx.write_header_with(d)?;
+    } else {
+        octx.write_header()?;
+    }
     let ost_tb = octx.stream(ost_index).unwrap().time_base();
     let enc_tb = encoder.time_base();
 
@@ -1369,6 +1547,7 @@ pub extern "C" fn chuks_ffmpeg_venc_open(
     fps_num: c_int,
     fps_den: c_int,
     encoder: *const c_char,
+    opts: *const c_char,
 ) -> *mut VideoWriter {
     let path = match unsafe { cstr(path) } {
         Some(s) => s,
@@ -1378,11 +1557,12 @@ pub extern "C" fn chuks_ffmpeg_venc_open(
         }
     };
     let family = unsafe { cstr(encoder) }.unwrap_or("h264");
+    let optspec = unsafe { cstr(opts) }.unwrap_or("");
     if width <= 0 || height <= 0 {
         set_err("venc_open: width/height must be > 0");
         return ptr::null_mut();
     }
-    match video_writer_open(path, width as u32, height as u32, fps_num, fps_den, family) {
+    match video_writer_open(path, width as u32, height as u32, fps_num, fps_den, family, optspec) {
         Ok(w) => Box::into_raw(Box::new(w)),
         Err(e) => {
             set_err(format!("venc_open: {e}"));
@@ -1911,5 +2091,174 @@ pub extern "C" fn chuks_ffmpeg_concat_run(b: *mut ConcatBuilder, out_path: *cons
 pub unsafe extern "C" fn chuks_ffmpeg_concat_free(b: *mut ConcatBuilder) {
     if !b.is_null() {
         drop(Box::from_raw(b));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Single-image encode — one RGB24 frame -> a PNG or JPEG file. PNG is lossless
+// and takes rgb24 directly; .jpg/.jpeg use the native mjpeg encoder (scaled to
+// yuvj420p). An intra image is one packet, written straight to the file. Pairs
+// with the video reader (save a decoded frame) and lets an editor export stills.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn encode_image_bytes(
+    data: &[u8],
+    w: u32,
+    h: u32,
+    in_stride: usize,
+    is_png: bool,
+) -> Result<Vec<u8>, ff::Error> {
+    let _ = ff::init();
+    let enc_name = if is_png { "png" } else { "mjpeg" };
+    let codec = match ff::encoder::find_by_name(enc_name) {
+        Some(c) => c,
+        None => {
+            // PNG needs zlib, which the current LGPL build omits; JPEG (mjpeg) is
+            // native and always present. (zlib/PNG lands with the 0.1.3 build.)
+            if is_png {
+                set_err("save_image: PNG encoder not in this build (needs zlib); use a .jpg path");
+            }
+            return Err(ff::Error::EncoderNotFound);
+        }
+    };
+    let target = if is_png { Pixel::RGB24 } else { Pixel::YUVJ420P };
+    let mut enc = ff::codec::context::Context::new_with_codec(codec)
+        .encoder()
+        .video()?;
+    enc.set_width(w);
+    enc.set_height(h);
+    enc.set_format(target);
+    enc.set_time_base(ff::Rational::new(1, 1));
+    let mut encoder = enc.open()?;
+
+    // packed RGB24 -> frame (respecting the caller's input stride)
+    let mut rgb = VideoFrame::new(Pixel::RGB24, w, h);
+    let row = (w * 3) as usize;
+    let src_stride = if in_stride == 0 { row } else { in_stride };
+    {
+        let dst_stride = rgb.stride(0);
+        let dst = rgb.data_mut(0);
+        for y in 0..h as usize {
+            dst[y * dst_stride..y * dst_stride + row]
+                .copy_from_slice(&data[y * src_stride..y * src_stride + row]);
+        }
+    }
+    let mut frame = if is_png {
+        rgb
+    } else {
+        let mut sc = Scaler::get(Pixel::RGB24, w, h, target, w, h, ScaleFlags::BILINEAR)?;
+        let mut out = VideoFrame::empty();
+        sc.run(&rgb, &mut out)?;
+        out
+    };
+    frame.set_pts(Some(0));
+    encoder.send_frame(&frame)?;
+    encoder.send_eof()?;
+    let mut pkt = ff::Packet::empty();
+    while encoder.receive_packet(&mut pkt).is_ok() {
+        if let Some(bytes) = pkt.data() {
+            return Ok(bytes.to_vec());
+        }
+    }
+    Err(ff::Error::InvalidData)
+}
+
+/// Encode one RGB24 frame to an image file: PNG when `path` ends in ".png",
+/// otherwise JPEG. `stride` is the input's bytes/row (0 = packed width*3). A
+/// video reader's frame() + stride() can be passed straight through. Returns 0
+/// on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn chuks_ffmpeg_save_image(
+    data: *const c_void,
+    width: c_int,
+    height: c_int,
+    stride: c_int,
+    path: *const c_char,
+) -> c_int {
+    let p = match unsafe { cstr(path) } {
+        Some(s) => s,
+        None => {
+            set_err("save_image: null path");
+            return -1;
+        }
+    };
+    if data.is_null() || width <= 0 || height <= 0 {
+        set_err("save_image: null data or non-positive dimensions");
+        return -1;
+    }
+    let row = (width as usize) * 3;
+    let in_stride = if stride <= 0 { row } else { stride as usize };
+    let need = in_stride * (height as usize);
+    let slice = unsafe { std::slice::from_raw_parts(data as *const u8, need) };
+    let is_png = p.to_lowercase().ends_with(".png");
+    match encode_image_bytes(slice, width as u32, height as u32, in_stride, is_png) {
+        Ok(bytes) => match std::fs::write(p, bytes) {
+            Ok(()) => 0,
+            Err(e) => {
+                set_err(format!("save_image: writing {p}: {e}"));
+                -1
+            }
+        },
+        Err(e) => {
+            set_err(format!("save_image: {e}"));
+            -1
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GIF — encode a video (or image sequence) to an animated GIF via the standard
+// single-pass palette filtergraph (palettegen + paletteuse). This keeps colour
+// quality high WITHOUT writing an intermediate palette PNG (the PNG encoder
+// needs zlib, absent from this build), because the palette flows through the
+// graph as frames. The gif encoder + these filters are all native to FFmpeg.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn to_gif_inner(input: &str, output: &str, fps: i32, scale: &str) -> Result<i64, ff::Error> {
+    let f = if fps > 0 { fps } else { 15 };
+    // fps then optional scale, then split -> palettegen / paletteuse. The graph
+    // ends in pal8 (via opts outpix=pal8) which the gif encoder consumes.
+    let mut chain = format!("fps={f}");
+    if !scale.is_empty() {
+        chain.push(',');
+        chain.push_str(scale);
+    }
+    let spec = format!("{chain},split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=5");
+    let opts = format!("fps={f};outpix=pal8");
+    transcode_inner(input, output, "gif", &spec, "", &opts, 0)
+}
+
+/// Encode a video or image sequence to an animated GIF. `fps` caps the frame
+/// rate (0 => 15, a sane default for shareable GIFs); `scale` is an optional
+/// scale filter expression, e.g. "scale=480:-1:flags=lanczos" ("" = keep size).
+/// Returns frames written, -1 on error.
+#[no_mangle]
+pub extern "C" fn chuks_ffmpeg_to_gif(
+    input: *const c_char,
+    output: *const c_char,
+    fps: c_int,
+    scale: *const c_char,
+) -> i64 {
+    let inp = match unsafe { cstr(input) } {
+        Some(s) => s.to_string(),
+        None => {
+            set_err("to_gif: null input");
+            return -1;
+        }
+    };
+    let outp = match unsafe { cstr(output) } {
+        Some(s) => s.to_string(),
+        None => {
+            set_err("to_gif: null output");
+            return -1;
+        }
+    };
+    let scl = unsafe { cstr(scale) }.unwrap_or("").to_string();
+    match to_gif_inner(&inp, &outp, fps, &scl) {
+        Ok(n) => n,
+        Err(e) => {
+            set_err(format!("to_gif: {e}"));
+            -1
+        }
     }
 }

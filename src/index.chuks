@@ -46,6 +46,54 @@ export enum AudioEncoder {
     AAC      // re-encode audio to AAC (native LGPL encoder)
 }
 
+// Fluent encoder/muxer options for transcode() and createVideo(). Build one by
+// chaining the setters, then pass it as the last argument:
+//   const opts = new EncodeOptions().videoBitrate(12_000_000).gop(60).faststart()
+//   ff.transcode("in.mp4", "out.mp4", VideoEncoder.H264, "", AudioEncoder.COPY, opts)
+// Every option is optional; unset ones use the codec/muxer defaults. Options
+// that don't apply to the chosen encoder are ignored (e.g. crf/preset on a
+// hardware encoder), so it is safe to set them unconditionally.
+export class EncodeOptions {
+    var _spec: string
+    constructor() { this._spec = "" }
+
+    private add(k: string, v: string): EncodeOptions {
+        this._spec = this._spec == "" ? (k + "=" + v) : (this._spec + ";" + k + "=" + v)
+        return this
+    }
+
+    // Target video bit rate in bits/sec (e.g. 12000000 = 12 Mbps). The main knob
+    // for hardware encoders (VideoToolbox/NVENC), which are bitrate-targeted.
+    public videoBitrate(bitsPerSec: int): EncodeOptions { return this.add("vbitrate", string(bitsPerSec)) }
+    // Keyframe interval in frames (GOP size). Small values (e.g. 60) make seeking
+    // and parallel range-encoding land on keyframes quickly.
+    public gop(frames: int): EncodeOptions { return this.add("gop", string(frames)) }
+    // Constant Rate Factor for software encoders (libx264 ~18-28, libvpx ~30);
+    // lower is higher quality. Ignored by hardware encoders.
+    public crf(value: int): EncodeOptions { return this.add("crf", string(value)) }
+    // Software encoder preset trading speed for compression, e.g. "veryfast",
+    // "medium", "slow" (libx264). Ignored by hardware encoders.
+    public preset(name: string): EncodeOptions { return this.add("preset", name) }
+    // Drop the audio track from the output entirely (ffmpeg -an).
+    public noAudio(): EncodeOptions { return this.add("an", "1") }
+    // Audio bit rate in bits/sec (e.g. 192000). Applies when re-encoding audio.
+    public audioBitrate(bitsPerSec: int): EncodeOptions { return this.add("abitrate", string(bitsPerSec)) }
+    // Force the output container/muxer by name (e.g. "mp4") when the output path
+    // has no extension for ffmpeg to infer one from.
+    public format(muxer: string): EncodeOptions { return this.add("format", muxer) }
+    // mp4/mov only: move the moov atom to the front (movflags +faststart) so the
+    // file starts playing immediately in a browser <video> tag.
+    public faststart(): EncodeOptions { return this.add("faststart", "1") }
+    // Finish at the shortest input stream when muxing (ffmpeg -shortest).
+    public shortest(): EncodeOptions { return this.add("shortest", "1") }
+    // Override the output frame rate (drops/duplicates frames to hit it). Also
+    // drives the encoder timebase, so pair it with a matching filter if resampling.
+    public fps(rate: int): EncodeOptions { return this.add("fps", string(rate)) }
+
+    // The compact spec string handed to the shim. Rarely called directly.
+    public spec(): string { return this._spec }
+}
+
 // A decoded, resampled 16 kHz mono PCM buffer owned by the shim. Call close()
 // when done. Its samples are readable zero-copy via data().
 export class AudioBuffer {
@@ -125,6 +173,13 @@ export class VideoReader {
 
     // Total duration of the media in seconds (-1 if unknown).
     public duration(): float { return this._ff._video_duration.call([this._ptr]) }
+
+    // Save the CURRENT frame (after next()) to an image file: PNG if `path` ends
+    // in ".png", else JPEG. Convenience over Ffmpeg.saveImage — e.g. grab a
+    // thumbnail after seek()+next(). Throws on error.
+    public saveFrame(path: string): void {
+        this._ff.saveImage(this.frame(), this.width(), this.height(), path, this.stride())
+    }
 
     public close(): void {
         if (this._closed) { return }
@@ -267,6 +322,9 @@ export class Ffmpeg {
     var _concat_add: CFunc
     var _concat_run: CFunc
     var _concat_free: CFunc
+    var _save_image: CFunc
+    var _encode_images: CFunc
+    var _to_gif: CFunc
 
     constructor(shimManifestDir: string = "chuks_packages/@chuks/ffmpeg") {
         const libPath: string = r.cargoBuild(shimManifestDir, true)
@@ -291,10 +349,10 @@ export class Ffmpeg {
         this._video_pts = L.symbol("chuks_ffmpeg_video_pts", new CSig([CSig.T_PTR], CSig.T_DOUBLE))
         this._video_duration = L.symbol("chuks_ffmpeg_video_duration", new CSig([CSig.T_PTR], CSig.T_DOUBLE))
         this._video_free = L.symbol("chuks_ffmpeg_video_free", new CSig([CSig.T_PTR], CSig.T_VOID))
-        this._transcode = L.symbol("chuks_ffmpeg_transcode", new CSig([CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING], CSig.T_INT64))
+        this._transcode = L.symbol("chuks_ffmpeg_transcode", new CSig([CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING], CSig.T_INT64))
         this._last_video_encoder = L.symbol("chuks_ffmpeg_last_video_encoder", new CSig([], CSig.T_PTR))
         this._has_encoder = L.symbol("chuks_ffmpeg_has_encoder", new CSig([CSig.T_CSTRING], CSig.T_INT))
-        this._venc_open = L.symbol("chuks_ffmpeg_venc_open", new CSig([CSig.T_CSTRING, CSig.T_INT, CSig.T_INT, CSig.T_INT, CSig.T_INT, CSig.T_CSTRING], CSig.T_PTR))
+        this._venc_open = L.symbol("chuks_ffmpeg_venc_open", new CSig([CSig.T_CSTRING, CSig.T_INT, CSig.T_INT, CSig.T_INT, CSig.T_INT, CSig.T_CSTRING, CSig.T_CSTRING], CSig.T_PTR))
         this._venc_write = L.symbol("chuks_ffmpeg_venc_write", new CSig([CSig.T_PTR, CSig.T_PTR, CSig.T_INT, CSig.T_INT], CSig.T_INT))
         this._venc_close = L.symbol("chuks_ffmpeg_venc_close", new CSig([CSig.T_PTR], CSig.T_INT64))
         this._mux = L.symbol("chuks_ffmpeg_mux", new CSig([CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING], CSig.T_INT64))
@@ -316,6 +374,9 @@ export class Ffmpeg {
         this._concat_add = L.symbol("chuks_ffmpeg_concat_add", new CSig([CSig.T_PTR, CSig.T_CSTRING], CSig.T_INT))
         this._concat_run = L.symbol("chuks_ffmpeg_concat_run", new CSig([CSig.T_PTR, CSig.T_CSTRING], CSig.T_INT64))
         this._concat_free = L.symbol("chuks_ffmpeg_concat_free", new CSig([CSig.T_PTR], CSig.T_VOID))
+        this._save_image = L.symbol("chuks_ffmpeg_save_image", new CSig([CSig.T_PTR, CSig.T_INT, CSig.T_INT, CSig.T_INT, CSig.T_CSTRING], CSig.T_INT))
+        this._encode_images = L.symbol("chuks_ffmpeg_encode_images", new CSig([CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_INT], CSig.T_INT64))
+        this._to_gif = L.symbol("chuks_ffmpeg_to_gif", new CSig([CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_INT, CSig.T_CSTRING], CSig.T_INT64))
     }
 
     // FFmpeg build version string.
@@ -360,7 +421,7 @@ export class Ffmpeg {
     // how the audio track is handled: AudioEncoder.COPY (default) keeps it as-is,
     // AudioEncoder.AAC re-encodes it to AAC. Returns the number of video frames
     // written. Throws on error.
-    public transcode(inPath: string, outPath: string, encoder: VideoEncoder = VideoEncoder.H264, filter: string = "", audio: AudioEncoder = AudioEncoder.COPY): int {
+    public transcode(inPath: string, outPath: string, encoder: VideoEncoder = VideoEncoder.H264, filter: string = "", audio: AudioEncoder = AudioEncoder.COPY, opts: EncodeOptions? = null): int {
         // Pass the codec FAMILY; the shim resolves the best encoder built for
         // this platform (hardware first, software fallback).
         var name: string = "mpeg4"
@@ -369,7 +430,8 @@ export class Ffmpeg {
         else if (encoder == VideoEncoder.MJPEG) { name = "mjpeg" }
         var aud: string = "copy"
         if (audio == AudioEncoder.AAC) { aud = "aac" }
-        const n: int = this._transcode.call([inPath, outPath, name, filter, aud])
+        const spec: string = opts != null ? opts.spec() : ""
+        const n: int = this._transcode.call([inPath, outPath, name, filter, aud, spec])
         if (n < 0) { throw new Error("ffmpeg.transcode: " + this.lastError()) }
         return n
     }
@@ -392,12 +454,13 @@ export class Ffmpeg {
     // den defaults to fps/1). `encoder` is the codec family (default hardware
     // H.264), resolved to the best encoder for this platform. The container is
     // chosen from the output extension (.mp4/.mov/.mkv...). Throws on error.
-    public createVideo(outPath: string, width: int, height: int, fps: int = 30, encoder: VideoEncoder = VideoEncoder.H264): VideoWriter {
+    public createVideo(outPath: string, width: int, height: int, fps: int = 30, encoder: VideoEncoder = VideoEncoder.H264, opts: EncodeOptions? = null): VideoWriter {
         var name: string = "mpeg4"
         if (encoder == VideoEncoder.H264) { name = "h264" }
         else if (encoder == VideoEncoder.HEVC) { name = "hevc" }
         else if (encoder == VideoEncoder.MJPEG) { name = "mjpeg" }
-        const raw: any = this._venc_open.call([outPath, width, height, fps, 1, name])
+        const spec: string = opts != null ? opts.spec() : ""
+        const raw: any = this._venc_open.call([outPath, width, height, fps, 1, name, spec])
         const p: CPtr = new CPtr(raw, false, -1)
         if (p.isNull()) {
             throw new Error("ffmpeg.createVideo: " + this.lastError())
@@ -446,6 +509,42 @@ export class Ffmpeg {
         }
         const n: int = this._concat_run.call([b, outPath])
         if (n < 0) { throw new Error("ffmpeg.concat: " + this.lastError()) }
+        return n
+    }
+
+    // Save one RGB24 frame to an image file: PNG when `path` ends in ".png",
+    // otherwise JPEG. `rgb` points at width*height*3 bytes (or padded rows);
+    // `stride` is its bytes-per-row (0 = packed width*3), so a VideoReader's
+    // frame() + stride() pass straight through. Throws on error.
+    public saveImage(rgb: CPtr, width: int, height: int, path: string, stride: int = 0): void {
+        const rc: int = this._save_image.call([rgb, width, height, stride, path])
+        if (rc < 0) { throw new Error("ffmpeg.saveImage: " + this.lastError()) }
+    }
+
+    // Encode a numbered image sequence (image2 pattern, e.g. "frames/%06d.jpg")
+    // to a video at `fps`. `filter` and `opts` apply exactly as in transcode
+    // (e.g. a scale/pad filtergraph, or EncodeOptions().faststart()). Image
+    // sequences carry no audio; add a soundtrack afterwards with mux(). Returns
+    // the number of frames written. Throws on error.
+    public encodeImages(pattern: string, outPath: string, fps: int = 30, encoder: VideoEncoder = VideoEncoder.H264, filter: string = "", opts: EncodeOptions? = null): int {
+        var name: string = "mpeg4"
+        if (encoder == VideoEncoder.H264) { name = "h264" }
+        else if (encoder == VideoEncoder.HEVC) { name = "hevc" }
+        else if (encoder == VideoEncoder.MJPEG) { name = "mjpeg" }
+        const spec: string = opts != null ? opts.spec() : ""
+        const n: int = this._encode_images.call([pattern, outPath, name, filter, spec, fps])
+        if (n < 0) { throw new Error("ffmpeg.encodeImages: " + this.lastError()) }
+        return n
+    }
+
+    // Encode a video (or image sequence) to an animated GIF using the standard
+    // palette pipeline (palettegen + paletteuse) for good colour, in a single
+    // pass (no intermediate palette file). `fps` caps the rate (0 => 15); `scale`
+    // is an optional scale filter, e.g. "scale=480:-1:flags=lanczos" ("" = keep
+    // size). Returns the number of frames written. Throws on error.
+    public toGif(input: string, outPath: string, fps: int = 15, scale: string = ""): int {
+        const n: int = this._to_gif.call([input, outPath, fps, scale])
+        if (n < 0) { throw new Error("ffmpeg.toGif: " + this.lastError()) }
         return n
     }
 

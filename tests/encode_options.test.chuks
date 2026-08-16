@@ -1,0 +1,32 @@
+// EncodeOptions: drop-audio, force-format (extensionless out), bitrate/gop/faststart,
+// on both transcode and createVideo.
+import { Ffmpeg, VideoEncoder, AudioEncoder, EncodeOptions, MediaInfo, VideoReader, VideoWriter } from "../src/index.chuks"
+const DIR: string = "/Users/chukwuemekaigbokwe/Box/Code/ChuksPackages/chuks_ffmpeg"
+const ff: Ffmpeg = new Ffmpeg(DIR + "/shim")
+
+// 1. transcode ff_av.mp4 (has audio) with noAudio + bitrate + gop + faststart -> no audio track.
+const o1: EncodeOptions = new EncodeOptions().videoBitrate(4000000).gop(30).noAudio().faststart()
+const n1: int = ff.transcode("/tmp/ff_av.mp4", "/tmp/ff_opt_noaudio.mp4", VideoEncoder.H264, "", AudioEncoder.COPY, o1)
+using const i1 = ff.probe("/tmp/ff_opt_noaudio.mp4")
+println("noAudio: frames=" + string(n1) + " hasVideo=" + string(i1.hasVideo()) + " hasAudio=" + string(i1.hasAudio()))
+const okDrop: bool = n1 == 10 && i1.hasVideo() && !i1.hasAudio()
+
+// 2. force muxer on an EXTENSIONLESS output path (mirrors media-store ids + `-f mp4`).
+const o2: EncodeOptions = new EncodeOptions().format("mp4").videoBitrate(4000000).gop(60).noAudio()
+const n2: int = ff.transcode("/tmp/ff_test.mp4", "/tmp/ff_opt_noext", VideoEncoder.H264, "", AudioEncoder.COPY, o2)
+using const i2 = ff.probe("/tmp/ff_opt_noext")
+println("forceFormat: frames=" + string(n2) + " " + string(i2.width()) + "x" + string(i2.height()) + " v=" + i2.videoCodec())
+const okFmt: bool = n2 == 10 && i2.width() == 320 && i2.videoCodec() == "h264"
+
+// 3. createVideo with format + bitrate on an extensionless path.
+const o3: EncodeOptions = new EncodeOptions().format("mp4").videoBitrate(2000000)
+using const src = ff.openVideo("/tmp/ff_test.mp4")
+const w: VideoWriter = ff.createVideo("/tmp/ff_opt_cv", 320, 240, 10, VideoEncoder.H264, o3)
+var pushed: int = 0
+while (src.next()) { w.writeFrame(src.frame(), src.stride()); pushed = pushed + 1 }
+w.close()
+using const i3 = ff.probe("/tmp/ff_opt_cv")
+println("createVideo+fmt: pushed=" + string(pushed) + " " + string(i3.width()) + "x" + string(i3.height()) + " v=" + i3.videoCodec())
+const okCv: bool = pushed == 10 && i3.width() == 320 && i3.hasVideo()
+
+println("ENCODE OPTIONS OK: " + string(okDrop && okFmt && okCv))

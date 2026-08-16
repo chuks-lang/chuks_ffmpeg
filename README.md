@@ -323,6 +323,73 @@ first, then `concat`.
 
 ---
 
+## Encode options — `EncodeOptions`
+
+Fine-tune the encoder and muxer for `transcode` and `createVideo` with a fluent
+builder, passed as the last argument. Every option is optional; unset ones use
+the codec/muxer defaults, and options that don't apply to the chosen encoder
+(e.g. `crf`/`preset` on a hardware encoder) are ignored, so they're safe to set.
+
+```chuks
+const opts = new EncodeOptions()
+    .videoBitrate(12_000_000)   // 12 Mbps (the main knob for HW encoders)
+    .gop(60)                    // keyframe every 60 frames (fast seeking)
+    .faststart()                // mp4 moov atom at front (instant web playback)
+    .noAudio()                  // drop the audio track (-an)
+ff.transcode("in.mov", "out.mp4", VideoEncoder.H264, "", AudioEncoder.COPY, opts)
+```
+
+| Setter | ffmpeg equivalent | Notes |
+|---|---|---|
+| `.videoBitrate(bps)` | `-b:v` | Target video bitrate, bits/sec |
+| `.gop(frames)` | `-g` | Keyframe interval |
+| `.crf(v)` | `-crf` | Quality mode (software encoders) |
+| `.preset(name)` | `-preset` | e.g. `"veryfast"` (software encoders) |
+| `.fps(rate)` | `-r` | Output frame rate override |
+| `.noAudio()` | `-an` | Drop the audio track |
+| `.audioBitrate(bps)` | `-b:a` | Audio bitrate when re-encoding |
+| `.format(muxer)` | `-f` | Force container for extensionless outputs |
+| `.faststart()` | `-movflags +faststart` | mp4/mov streaming |
+
+## Images — `encodeImages`, `saveImage`, `saveFrame`
+
+Encode a numbered image sequence to video (the classic render-frames-to-disk →
+video pipeline), and save individual frames as images.
+
+```chuks
+// frames/000000.jpg, 000001.jpg, ... -> mp4 at 30fps, scaled + faststart.
+ff.encodeImages("frames/%06d.jpg", "out.mp4", 30, VideoEncoder.H264,
+    "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+    new EncodeOptions().faststart())
+
+// Save the current decoder frame (after next()) to an image (JPEG or PNG*).
+using const v = ff.openVideo("clip.mp4")
+v.seek(5.0)
+if (v.next()) { v.saveFrame("thumb.jpg") }   // thumbnail at 5s
+
+// Or from any RGB24 buffer:
+ff.saveImage(rgbPtr, width, height, "frame.jpg", stride)
+```
+
+Image sequences carry no audio; add a soundtrack afterwards with `mux`. Output
+format follows the extension: **JPEG** (`.jpg`), BMP, TIFF. *(PNG needs zlib and
+lands in 0.1.3.)*
+
+## GIF — `toGif`
+
+Encode a video or image sequence to an animated GIF through the standard
+palettegen/paletteuse pipeline (good colour), in a single pass with no
+intermediate palette file:
+
+```chuks
+ff.toGif("clip.mp4", "out.gif", 15, "scale=480:-1:flags=lanczos")
+```
+
+`fps` caps the rate (`0` → 15, a sane default for shareable GIFs); `scale` is an
+optional scale filter (`""` keeps the size). Returns the frame count.
+
+---
+
 ## Encoder capabilities
 
 ```chuks
